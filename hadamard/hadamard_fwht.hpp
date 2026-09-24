@@ -6,6 +6,7 @@
 // passes through SLM and a final radix-2 pass that stores; fp32 butterflies,
 // DT only at load/store. Same stage order as the OpenCL and xetla-plugin SYCL
 // kernels, so results match them bit for bit.
+//   inverse: y = s * H_1024 x / 32 (signs applied after the transform)
 //   launch: nd_range<1>(rows * K / 1024 * 128, 128)
 #pragma once
 
@@ -33,6 +34,7 @@ struct Fwht1024 {
     const signed char *signs;  // [K], or nullptr
     unsigned short *y;
     int K;
+    bool inverse = false;  // y = s * H_1024 x / 32 (undo the rotation on embeddings)
 
     void operator()(sycl::nd_item<1> it) const {
         using D = xe2::dt<BF16>;
@@ -44,6 +46,8 @@ struct Fwht1024 {
         const unsigned short *xb = x + off;
         unsigned short *yb = y + off;
         const signed char *sb = signs ? signs + (blk % bpr) * 1024 : nullptr;
+        const signed char *si = inverse ? sb : nullptr;
+        if (inverse) sb = nullptr;
 
         float v[8];
         int base = lid * 8;
@@ -78,8 +82,13 @@ struct Fwht1024 {
         for (int j = 0; j < 4; ++j) {
             const int i = lid + j * 128;
             const float a = slm[i], b = slm[i + 512];
-            yb[i] = D::from((a + b) * scale);
-            yb[i + 512] = D::from((a - b) * scale);
+            float lo = (a + b) * scale, hi = (a - b) * scale;
+            if (si) {
+                lo *= (float)si[i];
+                hi *= (float)si[i + 512];
+            }
+            yb[i] = D::from(lo);
+            yb[i + 512] = D::from(hi);
         }
     }
 

@@ -20,10 +20,10 @@ SHAPES_ALL=(8B.qkv:4096:6144 8B.o_proj:4096:4096 8B.gate_up:4096:24576 8B.down:1
             27B.out_proj:6144:5120 27B.qkv:5120:14336 27B.lm_head:5120:248320)
 if [[ " $DO " == *" validate "* ]]; then
   mkdir -p $HERE/hadamard/results
-  for dt in fp16 bf16; do for s in "--rows 1 --k 5120" "--rows 1024 --k 5120" "--rows 77 --k 17408 --no-signs"; do
+  for dt in fp16 bf16; do for s in "--rows 1 --k 5120" "--rows 1024 --k 5120" "--rows 77 --k 17408 --no-signs" "--rows 33 --k 6144 --inverse"; do
     echo "hadamard $dt $s | $($HERE/hadamard/build/hadamard_sycl $s --dtype $dt 2>&1 | grep -a 'summary')"
   done; done > $HERE/hadamard/results/val_$ARCH.txt
-  echo "hadamard validate [$ARCH]: $(grep -c PASSED $HERE/hadamard/results/val_$ARCH.txt)/6 passed"
+  echo "hadamard validate [$ARCH]: $(grep -c PASSED $HERE/hadamard/results/val_$ARCH.txt)/8 passed"
 fi
 for v in $VARIANT; do
   d=$HERE/$v; mkdir -p $d/results
