@@ -15,10 +15,12 @@ methodology, benchmarked against the TernOCL kernels on identical inputs.
 | [int2_fp16_upcvt](int2_fp16_upcvt/) | int2 weights upconverted to fp16/bf16, fp16/bf16 DPAS, fp32 acc | fp16 or bf16 | `int2_fp16_upcvt.cl` |
 | [int2_via_int2_x_int8_dpas](int2_via_int2_x_int8_dpas/) | activations quantized to int8 (per row and 128-group), native s8 x s2 DPAS, int32 acc | fp16 or bf16 | `int2_int8_dpas.cl` |
 | [hadamard](hadamard/) | fused sign flip + blockwise 1024 Walsh-Hadamard input transform (Bonsai 2) | fp16 or bf16 | `hadamard_fwht.cl` |
+| [bitcos_fp16_upcvt](bitcos_fp16_upcvt/) | BITCOS ternary weights (presence bitmap + compacted signs, `2 - z` bits/weight) decoded through an SLM table to fp16/bf16, fp16/bf16 DPAS, fp32 acc | fp16 or bf16 | `bitcos_fp16_upcvt.cl` |
 
-Both GEMM variants have a decode GEMV (M = 1..8) and a large-M GEMM (prefill),
+The GEMM variants have a decode GEMV (M = 1..8) and a large-M GEMM (prefill),
 and handle any M (ragged tiles are zero-filled on read and clipped on write).
-They need `N % 16 == 0` and `K % 128 == 0`, with scale group size 128.
+They need `N % 16 == 0` and `K % 128 == 0`, with scale group size 128 (BITCOS
+GEMV: `K % (64 * LS) == 0`).
 
 ## How the kernels are written
 
@@ -30,7 +32,9 @@ kernels, declared in [common/xe2.hpp](common/xe2.hpp):
 * 2D block I/O: `__builtin_IB_subgroup_block_read_flat_*` / `..._write_flat_*`.
 * Sub-group block reads: `intel_sub_group_block_read{,4,_us,_us4,_us8}`.
 * The int8 large-M kernel quantizes A with XeTLA's instruction sequence as
-  inline vISA, as in TernOCL.
+  inline vISA, as in TernOCL; the BITCOS kernels apply the fp16 scale with
+  XeTLA's two SIMD32 `hf` multiplies as inline vISA (`--int-apply` and
+  `--simt-mul` select the alternatives, bf16 always uses the integer AND).
 * 256 GRF (large-M kernels) via the `grf_size<256>` kernel property; required
   sub-group and work-group sizes via kernel properties.
 
@@ -53,6 +57,8 @@ int2_fp16_upcvt/   kernels (int2_fp16_upcvt.hpp), driver, Makefile, validate.sh,
 int2_via_int2_x_int8_dpas/
                    kernels (int2_int8_dpas.hpp), driver, Makefile, validate.sh, bench.sh
 hadamard/          kernel (hadamard_fwht.hpp), validating driver, Makefile
+bitcos_fp16_upcvt/ kernels (bitcos_fp16_upcvt.hpp), driver, Makefile, validate.sh, bench.sh;
+                   host packer in common/bitcos.hpp
 run_all.sh         validate / epilogues / bench (vs TernOCL) for every variant, dtype and M
 validate_epilogues.sh
 ```
@@ -70,12 +76,14 @@ source /swtools/intel/2026.0/oneapi-vars.sh --force
 make -C int2_fp16_upcvt              # AOT for AOT_DEVICES=bmg-g31,lnl-m (default)
 make -C int2_via_int2_x_int8_dpas
 make -C hadamard
+make -C bitcos_fp16_upcvt
 # make -C ... AOT_DEVICES=bmg-g21    # other devices; JIT=1 builds SPIR-V only
 
 # TernOCL reference drivers (bench.sh compares against them)
 git clone https://github.com/libxsmm/TernOCL.git
 make -C TernOCL/int2_fp16_upcvt CXX=g++
 make -C TernOCL/int2_via_int2_x_int8_dpas CXX=g++
+make -C TernOCL/bitcos_fp16_upcvt CXX=g++
 ```
 
 The kernels are compiled ahead of time (`-fsycl-targets=spir64_gen`). Use AOT
@@ -193,6 +201,18 @@ faster. The int8 times include the activation-quantization pre-kernel.
 | 27B.qkv | 5120 x 14336 | 36.3 | 35.4 | x1.03 | 0.859 | 0.854 | x1.01 |
 | 27B.lm_head | 5120 x 248320 | 566.1 | 565.4 | x1.00 | 14.837 | 14.909 | x0.99 |
 
+**bitcos_fp16_upcvt** (Bonsai 2 27B shapes, zero density 0.40, fp16;
+`bitcos_fp16_upcvt/validate.sh`: 72/72, `bench.sh`)
+
+| shape | K x N | GEMV OCL (us) | GEMV SYCL (us) | SYCL/OCL | GEMM OCL (ms) | GEMM SYCL (ms) | SYCL/OCL |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 27B.gate_up | 5120 x 34816 | 105.3 | 103.4 | x1.02 | 4.93 | 5.35 | x0.92 |
+| 27B.down | 17408 x 5120 | 53.3 | 58.5 | x0.91 | 2.52 | 2.60 | x0.97 |
+| 27B.qkvz | 5120 x 16384 | 49.4 | 48.5 | x1.02 | 2.35 | 2.45 | x0.96 |
+| 27B.out_proj | 6144 x 5120 | 22.2 | 22.6 | x0.98 | 0.89 | 0.93 | x0.96 |
+| 27B.qkv | 5120 x 14336 | 44.3 | 42.9 | x1.03 | 1.96 | 2.06 | x0.95 |
+| 27B.lm_head | 5120 x 248320 | 607 | 614 | x0.99 | 35.1 | 38.7 | x0.91 |
+
 ## SYCL codegen notes
 
 * **Builtins:** OpenCL-named builtins must match the OpenCL mangling
@@ -223,6 +243,14 @@ faster. The int8 times include the activation-quantization pre-kernel.
 * **bf16, qmode 1:** the int8 large-M kernel with in-GEMM quantization and bf16
   activations is ~7% slower than TernOCL on the 27B gate_up shape (2.05 vs
   1.91 ms); fp16 is on par.
+* **BITCOS gaps:** the GEMV inner loop matches TernOCL's (214 vs 213
+  instructions per 64 k, same 32 SIMD32 `hf` multiplies and 4 DPAS), but IGC
+  issues the A load after the first use of the sign gather, where the OpenCL
+  build issues it before. On narrow-N, long-K shapes with LS = 2 the latency is
+  exposed (down / out_proj ~20% slower at that tile, 9% at the best one). The
+  M-tiled loop carries ~50 more scalar and integer instructions than OpenCL's
+  (336 vs 286 at 64x16). A-ahead prefetch, a software-pipelined loop, 32-bit
+  offsets and allocation alignment did not close either gap.
 
 ## License
 

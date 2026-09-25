@@ -22,6 +22,7 @@ XE2_VEC(int, 2, int2);
 XE2_VEC(int, 4, int4);
 XE2_VEC(int, 8, int8);
 XE2_VEC(unsigned, 2, uint2);
+XE2_VEC(unsigned, 3, uint3);
 XE2_VEC(unsigned, 4, uint4);
 XE2_VEC(unsigned, 8, uint8);
 XE2_VEC(float, 2, float2);
@@ -70,6 +71,7 @@ XE2_OCL(xe2::ushort8 intel_sub_group_block_read_us8(const XE2_GLOBAL unsigned sh
 #define XE2_2D_RD(ret, sfx) \
     XE2_IB(ret __builtin_IB_subgroup_block_read_flat_##sfx(long base, int w, int h, int p, xe2::int2 c));
 XE2_2D_RD(unsigned, u32_m1k16v1)
+XE2_2D_RD(xe2::uint2, u32_m2k16v1)
 XE2_2D_RD(xe2::uint8, u32_m8k16v1)
 XE2_2D_RD(unsigned short, u16_m1k16v1)
 XE2_2D_RD(xe2::ushort2, u16_m1k16v2)
@@ -83,6 +85,8 @@ XE2_IB(void __builtin_IB_subgroup_block_write_flat_u32_m8k16v1(long base, int w,
 // cache control 0 = default
 XE2_IB(void __builtin_IB_subgroup_block_read_prefetch_u32_m8k16v1(long base, int w, int h, int p,
         xe2::int2 c, int cc));
+// per-lane LSC load with cache control (IGC LSC_LDCC: 4 = L1 cached, L3 cached)
+XE2_IB(xe2::uint3 __builtin_IB_lsc_load_global_uint3(const XE2_GLOBAL xe2::uint3 *p, int imm_off, int cc));
 
 namespace xe2 {
 
@@ -96,6 +100,9 @@ struct surf {
 
 inline unsigned rd_32b_1r16(const surf &s, int x, int y) {
     return __builtin_IB_subgroup_block_read_flat_u32_m1k16v1(s.base, s.w, s.h, s.p, int2{x, y});
+}
+inline uint2 rd_32b_2r16(const surf &s, int x, int y) {
+    return __builtin_IB_subgroup_block_read_flat_u32_m2k16v1(s.base, s.w, s.h, s.p, int2{x, y});
 }
 inline uint8 rd_32b_8r16(const surf &s, int x, int y) {
     return __builtin_IB_subgroup_block_read_flat_u32_m8k16v1(s.base, s.w, s.h, s.p, int2{x, y});
