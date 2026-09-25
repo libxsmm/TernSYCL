@@ -35,8 +35,10 @@ kernels, declared in [common/xe2.hpp](common/xe2.hpp):
   inline vISA, as in TernOCL; the BITCOS kernels apply the fp16 scale with
   XeTLA's two SIMD32 `hf` multiplies as inline vISA (`--int-apply` and
   `--simt-mul` select the alternatives, bf16 always uses the integer AND).
-* 256 GRF (large-M kernels) via the `grf_size<256>` kernel property; required
-  sub-group and work-group sizes via kernel properties.
+* 256 GRF (large-M kernels) via the `grf_size<256>` kernel property plus the
+  AOT option `-ze-opt-large-register-file` (upcvt); the GEMV kernels request
+  `grf_size<128>`. Required sub-group and work-group sizes via kernel
+  properties.
 
 Tile parameters are template parameters. Each driver compiles a table of tiles
 (`--list-tiles`, one device image per kernel with
@@ -157,17 +159,17 @@ faster. The int8 times include the activation-quantization pre-kernel.
 
 | shape | K x N | GEMV OCL (us) | GEMV SYCL (us) | SYCL/OCL | GEMM OCL (ms) | GEMM SYCL (ms) | SYCL/OCL |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 8B.qkv | 4096 x 6144 | 16.9 | 16.5 | x1.02 | 0.459 | 0.468 | x0.98 |
-| 8B.o_proj | 4096 x 4096 | 11.8 | 12.3 | x0.95 | 0.312 | 0.317 | x0.98 |
-| 8B.gate_up | 4096 x 24576 | 57.4 | 57.2 | x1.00 | 1.878 | 1.867 | x1.01 |
-| 8B.down | 12288 x 4096 | 29.6 | 28.8 | x1.02 | 0.914 | 0.913 | x1.00 |
-| 8B.lm_head | 4096 x 151680 | 356.6 | 350.9 | x1.02 | 12.005 | 12.263 | x0.98 |
-| 27B.gate_up | 5120 x 34816 | 108.1 | 107.2 | x1.01 | 3.375 | 3.318 | x1.02 |
-| 27B.down | 17408 x 5120 | 51.6 | 52.1 | x0.99 | 1.776 | 1.828 | x0.97 |
-| 27B.qkvz | 5120 x 16384 | 46.4 | 45.9 | x1.01 | 1.491 | 1.520 | x0.98 |
-| 27B.out_proj | 6144 x 5120 | 21.1 | 20.5 | x1.03 | 0.630 | 0.647 | x0.97 |
-| 27B.qkv | 5120 x 14336 | 41.1 | 41.7 | x0.98 | 1.300 | 1.320 | x0.98 |
-| 27B.lm_head | 5120 x 248320 | 716.4 | 706.3 | x1.01 | 25.514 | 26.062 | x0.98 |
+| 8B.qkv | 4096 x 6144 | 17.4 | 16.6 | x1.05 | 0.452 | 0.455 | x0.99 |
+| 8B.o_proj | 4096 x 4096 | 11.8 | 12.2 | x0.96 | 0.310 | 0.313 | x0.99 |
+| 8B.gate_up | 4096 x 24576 | 57.0 | 57.1 | x1.00 | 1.875 | 1.859 | x1.01 |
+| 8B.down | 12288 x 4096 | 29.6 | 28.7 | x1.03 | 0.900 | 0.881 | x1.02 |
+| 8B.lm_head | 4096 x 151680 | 363.4 | 356.3 | x1.02 | 11.944 | 11.694 | x1.02 |
+| 27B.gate_up | 5120 x 34816 | 110.7 | 107.3 | x1.03 | 3.388 | 3.345 | x1.01 |
+| 27B.down | 17408 x 5120 | 51.8 | 52.1 | x0.99 | 1.817 | 1.797 | x1.01 |
+| 27B.qkvz | 5120 x 16384 | 46.4 | 45.9 | x1.01 | 1.498 | 1.503 | x1.00 |
+| 27B.out_proj | 6144 x 5120 | 20.7 | 20.4 | x1.01 | 0.657 | 0.643 | x1.02 |
+| 27B.qkv | 5120 x 14336 | 41.2 | 41.8 | x0.99 | 1.311 | 1.295 | x1.01 |
+| 27B.lm_head | 5120 x 248320 | 725.2 | 704.3 | x1.03 | 25.486 | 25.068 | x1.02 |
 
 **int2_via_int2_x_int8_dpas, qmode 0 (A quantized to int8 upfront)**
 
@@ -228,6 +230,12 @@ faster. The int8 times include the activation-quantization pre-kernel.
   copy element by element.
 * **Runtime epilogue:** in the int8 large-M kernel, a runtime-selected epilogue
   changes the register allocation of the K loop and costs ~3%.
+* **256 GRF:** the `grf_size<256>` property alone gives IGC
+  `-HWThreadNumberPerEU 4` but not `-TotalGRFNum 256`. The upcvt 128x16
+  large-M K loop then rotates the A tiles through ~7 registers (167 `sync` vs
+  16 in the OpenCL build) and is 10-17% slower. Linking with
+  `-Xs "-options -ze-opt-large-register-file"` restores the OpenCL schedule;
+  it applies to every kernel, so the GEMV kernels request `grf_size<128>`.
 * **Vector conversions:** convert int32 accumulators with
   `__builtin_convertvector(acc, float8)`. Per-element casts made IGC use one
   scratch register for every conversion, which stalled each following `mad`.
