@@ -10,7 +10,10 @@ CXXFLAGS  = -fsycl -std=c++20 -O3 -fp-model=precise -qopenmp -Wno-psabi -I../com
 LDFLAGS   = -fsycl -qopenmp
 ifndef JIT
 CXXFLAGS += -fsycl-targets=spir64_gen
-LDFLAGS  += -fsycl-targets=spir64_gen -Xs "-device $(AOT_DEVICES)" -fsycl-max-parallel-link-jobs=16
+# grf_size<256> alone does not give IGC -TotalGRFNum 256 (large-M K loop then reuses A registers);
+# the GEMV kernels request grf_size<128> and keep 128
+LDFLAGS  += -fsycl-targets=spir64_gen -Xs "-device $(AOT_DEVICES) -options -ze-opt-large-register-file" \
+            -fsycl-max-parallel-link-jobs=16
 endif
 
 BUILD  = build

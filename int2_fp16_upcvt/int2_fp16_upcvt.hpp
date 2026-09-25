@@ -164,7 +164,8 @@ struct Gemv {
     }
 
     auto get(syclex::properties_tag) const {
-        return syclex::properties{syclex::sub_group_size<16>, syclex::work_group_size<1, WG>};
+        return syclex::properties{syclex::sub_group_size<16>, syclex::work_group_size<1, WG>,
+                intelex::grf_size<128>};
     }
 };
 
