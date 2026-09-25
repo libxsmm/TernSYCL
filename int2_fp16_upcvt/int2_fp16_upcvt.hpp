@@ -197,6 +197,11 @@ struct GemmMT {
 #pragma unroll
             for (int j = 0; j < NB; ++j) acc[i][j] = 0.0f;
 
+#ifdef MT_APF
+        short8 an[MB];
+#pragma unroll
+        for (int i = 0; i < MB; ++i) an[i] = __builtin_bit_cast(short8, rd_16b_8r16(sa, 0, m0 + 8 * i));
+#endif
         for (int s = 0; s < K / GS; ++s) {
             uint8 w[NB];
             unsigned s2[NB];
@@ -207,12 +212,23 @@ struct GemmMT {
                         ? intel_sub_group_block_read_us(gptr(S + (size_t)s * N + n0 + 16 * j)) : 0u;
                 s2[j] = sc | (sc << 16);
             }
+#ifdef MT_APF
+#pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                short8 a[MB];
+#pragma unroll
+                for (int i = 0; i < MB; ++i) a[i] = an[i];
+#pragma unroll
+                for (int i = 0; i < MB; ++i)
+                    an[i] = __builtin_bit_cast(short8, rd_16b_8r16(sa, s * GS + 16 * (c + 1), m0 + 8 * i));
+#else
 #pragma unroll
             for (int c = 0; c < 8; ++c) {
                 short8 a[MB];
 #pragma unroll
                 for (int i = 0; i < MB; ++i)
                     a[i] = __builtin_bit_cast(short8, rd_16b_8r16(sa, s * GS + 16 * c, m0 + 8 * i));
+#endif
 #pragma unroll
                 for (int j = 0; j < NB; ++j) {
                     const int8 b = dq_word(w[j][c], s2[j]);
