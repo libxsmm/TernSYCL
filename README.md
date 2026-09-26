@@ -122,10 +122,17 @@ The same as TernOCL's:
 * **Timing:** device profiling events. For the int8 variant, the time includes
   the activation-quantization pre-kernel.
 * **Reported number:** for each shape, TernOCL and TernSYCL each pick their best
-  tile from the same tile list; then the two winners are re-measured
-  alternately 3 times on the same GPU and the median is reported.
+  tile from the same tile list (the sweep runs the two alternately on every
+  tile); then the two winners are re-measured alternately 3 times on the same
+  GPU and the median is reported.
 * **Lunar Lake:** `PACE=15` sleeps before each re-measure, because
-  shared-memory bandwidth drifts under sustained load.
+  shared-memory bandwidth drifts under sustained load. The unpaced sweep is
+  then only a pre-filter: the 4 fastest tiles of each side (`TOPK`) are
+  re-timed paced and the fastest is kept. Both drivers run on the same E-core
+  (`PIN`, default `taskset -c 4` on LNL): each driver's host thread spins in
+  the event wait, and on a P-core (up to ~4.5 GHz) it takes package power from
+  the GPU once PL1 limits it (GPU at ~1.2 instead of ~1.85 GHz), by an amount
+  that depends on the core the scheduler picked.
 
 Shapes: Bonsai 8B (Qwen3-8B: qkv 4096x6144, o_proj 4096x4096, gate_up
 4096x24576, down 12288x4096, lm_head 4096x151680) and Bonsai 27B (Qwen3.5-27B:
@@ -214,6 +221,26 @@ faster. The int8 times include the activation-quantization pre-kernel.
 | 27B.out_proj | 6144 x 5120 | 22.2 | 22.6 | x0.98 | 0.89 | 0.93 | x0.96 |
 | 27B.qkv | 5120 x 14336 | 44.3 | 42.9 | x1.03 | 1.96 | 2.06 | x0.95 |
 | 27B.lm_head | 5120 x 248320 | 607 | 614 | x0.99 | 35.1 | 38.7 | x0.91 |
+
+## Results (Arc 140V / Lunar Lake, fp16 activations)
+
+Same build and methodology, `PACE=15`, both drivers pinned to E-core 4.
+
+**int2_fp16_upcvt**
+
+| shape | K x N | GEMV OCL (us) | GEMV SYCL (us) | SYCL/OCL | GEMM OCL (ms) | GEMM SYCL (ms) | SYCL/OCL |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8B.qkv | 4096 x 6144 | 93.3 | 95.8 | x0.97 | 2.154 | 2.116 | x1.02 |
+| 8B.o_proj | 4096 x 4096 | 65.9 | 67.3 | x0.98 | 1.455 | 1.523 | x0.95 |
+| 8B.gate_up | 4096 x 24576 | 303.6 | 303.2 | x1.00 | 8.824 | 8.329 | x1.06 |
+| 8B.down | 12288 x 4096 | 155.7 | 156.8 | x0.99 | 4.991 | 5.236 | x0.95 |
+| 8B.lm_head | 4096 x 151680 | 1861.7 | 1851.2 | x1.01 | 50.011 | 52.594 | x0.95 |
+| 27B.gate_up | 5120 x 34816 | 540.3 | 543.0 | x0.99 | 15.009 | 14.434 | x1.04 |
+| 27B.down | 17408 x 5120 | 272.3 | 273.2 | x1.00 | 8.186 | 7.942 | x1.03 |
+| 27B.qkvz | 5120 x 16384 | 254.0 | 254.2 | x1.00 | 7.352 | 7.368 | x1.00 |
+| 27B.out_proj | 6144 x 5120 | 116.4 | 113.7 | x1.02 | 2.858 | 2.827 | x1.01 |
+| 27B.qkv | 5120 x 14336 | 226.6 | 228.0 | x0.99 | 6.272 | 6.103 | x1.03 |
+| 27B.lm_head | 5120 x 248320 | 3766.8 | 3759.0 | x1.00 | 115.969 | 115.416 | x1.00 |
 
 ## SYCL codegen notes
 

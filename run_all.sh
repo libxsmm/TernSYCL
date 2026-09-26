@@ -5,11 +5,14 @@
 #        TERNOCL=<TernOCL checkout with built drivers> (default ./TernOCL)
 #        CARDS="0 1 ..." spread the bench shapes over these GPUs (ZE_AFFINITY_MASK)
 #        PACE=s sleep before each re-measure (LNL: shared-memory bandwidth drifts)
+#        PIN="cmd" host-process prefix for both drivers (LNL default: taskset -c 4, an E-core;
+#        a driver spinning on a P-core takes package power from the GPU under PL1)
 # Results go to <variant>/results/{val,bench}_<arch>_<dtype>_m<M>.txt (+ .sweep with
 # every tile tried). The architecture (b70 / lnl) comes from the hostname; ARCH= overrides.
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 ARCH=${ARCH:-$(case $(hostname -s) in *lnl*) echo lnl;; *) echo b70;; esac)}
+export PIN=${PIN-$([[ $ARCH == lnl ]] && echo "taskset -c 4")}
 VARIANT=${VARIANT:-all}; DTYPES=${DTYPES:-fp16 bf16}; MS=${MS:-1 1024}; CARDS=${CARDS:-}
 export TERNOCL=${TERNOCL:-$HERE/TernOCL}
 [[ $VARIANT == all ]] && VARIANT="int2_fp16_upcvt int2_via_int2_x_int8_dpas"
