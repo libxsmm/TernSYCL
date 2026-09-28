@@ -88,7 +88,7 @@ inline unsigned sign_window(uint3 q, unsigned w0, unsigned rank) {
 }
 
 inline uint3 load_signs(const unsigned *p) {
-    return __builtin_IB_lsc_load_global_uint3((const XE2_GLOBAL uint3 *)p, 0, 4);
+    return ld_u3_cached((const uint3 *)p);
 }
 
 // scale operand for the apply, from the lane's 16-bit scale
@@ -189,11 +189,11 @@ struct Gemv {
             for (int r = 0; r < SGM; ++r) ap[r] = A + (size_t)sycl::min(m0 + r, M - 1) * K;
             for (unsigned k = k_begin; k < (unsigned)k_end; k += STEP) {
                 const uint2 bm = rd_32b_2r16(sbm, n0, k / 32);
-                const unsigned sc = intel_sub_group_block_read_us(gptr(sp + (k / GS) * (unsigned)N));
+                const unsigned sc = sg_rd_us(sp + (k / GS) * (unsigned)N);
                 ushort4 ar[SGM];
 #pragma unroll
                 for (int r = 0; r < SGM; ++r)
-                    ar[r] = (SGM == 1 || m0 + r < M) ? intel_sub_group_block_read_us4(gptr(ap[r] + k)) : ushort4{};
+                    ar[r] = (SGM == 1 || m0 + r < M) ? sg_rd_us4(ap[r] + k) : ushort4{};
                 const unsigned r0 = rank, r1 = r0 + sycl::popcount(bm.x);
                 rank = r1 + sycl::popcount(bm.y);
                 const unsigned w0 = r0 >> 5;
@@ -308,7 +308,7 @@ struct GemmMT {
             for (int j = 0; j < NB; ++j) {
                 if (n0 + 16 * j >= N) continue;  // uniform across the sub-group
                 const uint2 bm = rd_32b_2r16(sbm, n0 + 16 * j, k / 32);
-                const unsigned sc = intel_sub_group_block_read_us(gptr(sp[j] + (k / GS) * (unsigned)N));
+                const unsigned sc = sg_rd_us(sp[j] + (k / GS) * (unsigned)N);
                 const unsigned r0 = rank[j], r1 = r0 + sycl::popcount(bm.x);
                 rank[j] = r1 + sycl::popcount(bm.y);
                 const unsigned w0 = r0 >> 5;

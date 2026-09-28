@@ -96,11 +96,11 @@ struct Gemv {
     void load(const surf &sb, int m0, int n0, int s, unsigned *w, unsigned &sc, ushort8 *ar) const {
 #pragma unroll
         for (int r = 0; r < 8; ++r) w[r] = rd_32b_1r16(sb, n0, s * 8 + r);
-        sc = intel_sub_group_block_read_us(gptr(S + (size_t)s * N + n0));
+        sc = sg_rd_us(S + (size_t)s * N + n0);
 #pragma unroll
         for (int r = 0; r < SGM; ++r)
             ar[r] = (SGM == 1 || m0 + r < M)
-                    ? intel_sub_group_block_read_us8(gptr(A + (size_t)(m0 + r) * K + s * GS))
+                    ? sg_rd_us8(A + (size_t)(m0 + r) * K + s * GS)
                     : ushort8{};
     }
 
@@ -210,7 +210,7 @@ struct GemmMT {
             for (int j = 0; j < NB; ++j) {
                 w[j] = rd_32b_8r16(sb, n0 + 16 * j, s * 8);
                 const unsigned sc = (n0 + 16 * j < N)
-                        ? intel_sub_group_block_read_us(gptr(S + (size_t)s * N + n0 + 16 * j)) : 0u;
+                        ? sg_rd_us(S + (size_t)s * N + n0 + 16 * j) : 0u;
                 s2[j] = sc | (sc << 16);
             }
 #ifdef MT_APF

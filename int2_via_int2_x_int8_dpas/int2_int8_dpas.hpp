@@ -175,14 +175,14 @@ struct Gemv {
         for (int r = 0; r < SGM; ++r) {
             const bool ok = m0 + r < M;
             if constexpr (QMODE == 0) {
-                const ushort4 v = ok ? intel_sub_group_block_read_us4(
-                        gptr((const unsigned short *)(Aq + (size_t)(m0 + r) * K + s * GS))) : ushort4{};
+                const ushort4 v = ok ? sg_rd_us4(
+                        (const unsigned short *)(Aq + (size_t)(m0 + r) * K + s * GS)) : ushort4{};
 #pragma unroll
                 for (int c = 0; c < 4; ++c) set_el<SGM>(aq[c], r, (short)v[c]);
                 inv[r] = ok ? sycl::native::recip(D::tof(SA[(size_t)s * lda + m0 + r])) : 0.0f;
             } else {
-                const uint4 v = ok ? intel_sub_group_block_read4(
-                        gptr((const unsigned *)(A + (size_t)(m0 + r) * K + s * GS))) : uint4{};
+                const uint4 v = ok ? sg_rd_u4(
+                        (const unsigned *)(A + (size_t)(m0 + r) * K + s * GS)) : uint4{};
                 const float sa = ok ? D::tof(SA[(size_t)s * lda + m0 + r]) : 0.0f;
 #pragma unroll
                 for (int c = 0; c < 4; ++c) set_el<SGM>(aq[c], r, q2<BF16>(v[c], sa));
@@ -192,10 +192,10 @@ struct Gemv {
     }
 
     static fa_t step(fa_t acc, const uint8 &w, float sb, const a_t *aq, const float *inv) {
-        ia_t ia = 0;
+        ia_t ia = dpas_s2s8_z(aq[0], int2{(int)w[0], (int)w[1]});
 #pragma unroll
-        for (int c = 0; c < 4; ++c)
-            ia = intel_sub_group_i8_i2_matrix_mad_k32(aq[c], int2{(int)w[2 * c], (int)w[2 * c + 1]}, ia);
+        for (int c = 1; c < 4; ++c)
+            ia = dpas_s2s8(aq[c], int2{(int)w[2 * c], (int)w[2 * c + 1]}, ia);
 #pragma unroll
         for (int r = 0; r < SGM; ++r)
             set_el<SGM>(acc, r, el<SGM>(acc, r) + (float)el<SGM>(ia, r) * (sb * inv[r]));
@@ -227,7 +227,7 @@ struct Gemv {
 #pragma unroll
                 for (int u = 0; u < U; ++u) {
                     w[u] = rd_32b_8r16(sbs, n0, (s + u) * 8);
-                    sb[u] = D::tof(intel_sub_group_block_read_us(gptr(SB + (size_t)(s + u) * N + n0)));
+                    sb[u] = D::tof(sg_rd_us(SB + (size_t)(s + u) * N + n0));
                     load_a(m0, s + u, aq[u], inv[u]);
                 }
 #pragma unroll
@@ -237,7 +237,7 @@ struct Gemv {
                 a_t aq[4];
                 float inv[SGM];
                 const uint8 w = rd_32b_8r16(sbs, n0, s * 8);
-                const float sb = D::tof(intel_sub_group_block_read_us(gptr(SB + (size_t)s * N + n0)));
+                const float sb = D::tof(sg_rd_us(SB + (size_t)s * N + n0));
                 load_a(m0, s, aq, inv);
                 acc = step(acc, w, sb, aq, inv);
             }
@@ -355,11 +355,10 @@ struct GemmMT {
                 for (int r = 0; r < 8; ++r) inv[r] = sycl::native::recip(sycl::group_broadcast(sgp, sal, r));
 #pragma unroll
                 for (int j = 0; j < NB; ++j) {
-                    int8 ia = 0;
+                    int8 ia = dpas_s2s8_z(aq[0], int2{(int)w[j][0], (int)w[j][1]});
 #pragma unroll
-                    for (int c = 0; c < 4; ++c)
-                        ia = intel_sub_group_i8_i2_matrix_mad_k32(aq[c],
-                                int2{(int)w[j][2 * c], (int)w[j][2 * c + 1]}, ia);
+                    for (int c = 1; c < 4; ++c)
+                        ia = dpas_s2s8(aq[c], int2{(int)w[j][2 * c], (int)w[j][2 * c + 1]}, ia);
                     // whole-vector convert (OpenCL's convert_float8): per-element casts
                     // are emitted through one scratch register and stall every mad
                     const float8 fi = __builtin_convertvector(ia, float8);
