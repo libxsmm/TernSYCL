@@ -174,6 +174,20 @@ template <class SH> inline unsigned pl2d(const surf &s, int x, int y) {
             : "rw.u"(s.base), "rw.u"(s.w), "rw.u"(s.h), "rw.u"(s.p), "rw.u"(x), "rw.u"(y), "rw.u"(SH::code));
     return pl;
 }
+// in-place update of the block x (dword 5) or y (dword 6) of a payload: build the
+// payload once outside the K loop and move it per step (keeps one register per
+// payload live across the loop, as IGC does, instead of rebuilding all 8 dwords)
+template <int D> inline void pl2d_set(unsigned &pl, int v) {
+    static_assert(D == 5 || D == 6);
+    if constexpr (D == 5)
+        XE2_ASM("{\n.decl PD v_type=G type=ud num_elts=8 align=GRF alias=<%0,0>\n"
+                "mov (M1_NM, 1) PD(0,5)<1> %1(0,0)<0;1,0>\n}\n" : "+rw"(pl) : "rw.u"(v));
+    else
+        XE2_ASM("{\n.decl PD v_type=G type=ud num_elts=8 align=GRF alias=<%0,0>\n"
+                "mov (M1_NM, 1) PD(0,6)<1> %1(0,0)<0;1,0>\n}\n" : "+rw"(pl) : "rw.u"(v));
+}
+inline void pl2d_x(unsigned &pl, int x) { pl2d_set<5>(pl, x); }
+inline void pl2d_y(unsigned &pl, int y) { pl2d_set<6>(pl, y); }
 template <class SH, int DX, int DY, class T> inline T rd2d(unsigned pl) {
     T v;
     XE2_ASM((detail::rd2d_str<SH, DX, DY>()) : "=rw"(v) : "rw"(pl));
@@ -187,18 +201,17 @@ template <int N, class F> inline void static_for(F &&f) {
 }
 
 // Sub-group block reads, striped: element i of lane l = p[l + 16 i]; p must be
-// global and 4-byte aligned (16-byte for the vector forms). The scalar form is
-// group_load (a per-lane gather, as IGC emits for it); the vector forms are one
-// transposed LSC block load, whose dword order is the SIMD16 vector layout
-// (group_load lowers them to per-lane gathers).
+// global and 4-byte aligned (16-byte for the vector forms). One transposed LSC
+// block load, whose dword order is the SIMD16 vector layout (group_load lowers
+// these to per-lane gathers). The scalar form fills half a GRF but the load
+// writes a whole one, so it goes through a temp.
 inline unsigned short sg_rd_us(const unsigned short *p) {
-    namespace syclex = sycl::ext::oneapi::experimental;
-    auto gp = sycl::address_space_cast<sycl::access::address_space::global_space,
-            sycl::access::decorated::yes>(p).get_decorated();
-    unsigned short o;
-    syclex::group_load(sycl::ext::oneapi::this_work_item::get_sub_group(), gp, o,
-            syclex::properties{syclex::data_placement_striped, syclex::contiguous_memory, syclex::alignment<4>});
-    return o;
+    unsigned short v;
+    XE2_ASM("{\n.decl TP v_type=G type=uw num_elts=32 align=GRF\n"
+            "lsc_load.ugm (M1_NM, 1) TP:d32x8t flat[%1]:a64\n"
+            "mov (M1, 16) %0(0,0)<1> TP(0,0)<1;1,0>\n}\n"
+            : "=rw"(v) : "rw"((long)p));
+    return v;
 }
 #define XE2_BLK_RD(name, R, P, shape)                                                  \
     inline R name(const P *p) {                                                         \

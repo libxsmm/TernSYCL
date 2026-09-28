@@ -313,15 +313,38 @@ struct GemmMT {
 #pragma unroll
             for (int j = 0; j < NB; ++j) acc[i][j] = 0.0f;
 
+        // 2D payloads built once; each K step only moves y (B, SB, SA) or x (A)
+        unsigned pb = pl2d<b32_16x8>(sbs, n0, 0), psb2 = pl2d<b16_32x1>(ssb, n0, 0),
+                 psb1 = pl2d<b16_16x1>(ssb, n0, 0), psa = pl2d<b16_16x1>(ssa, m0, 0), pq;
+        if constexpr (QMODE == 0) pq = pl2d<b16_2x16x8>(surf(Aq, K, M, K), 0, m0);
+        else pq = pl2d<b32_16x8>(surf(A, K * 2, M, K * 2), 0, m0);
+
         for (int s = 0; s < K / GS; ++s) {
+            // A (and SA) loads first: they feed the quantization / unpacking that the
+            // first dpas waits on (the asm reads are issued in source order). Row
+            // block 0 before B and SB, block I + 1 at the start of block I.
+            pl2d_y(psa, s);
+            pl2d_x(pq, s * GS / 2);
+            unsigned short sar[MB];
+            std::conditional_t<QMODE == 0, ushort16[2], uint8[4]> ar[MB];
+            auto load_a = [&](auto ii) {
+                constexpr int I = decltype(ii)::value;
+                sar[I] = rd2d<b16_16x1, 8 * I, 0, unsigned short>(psa);
+                if constexpr (QMODE == 0)
+                    static_for<2>([&](auto h) { ar[I][h] = rd2d<b16_2x16x8, 32 * decltype(h)::value, 8 * I, ushort16>(pq); });
+                else
+                    static_for<4>([&](auto c) { ar[I][c] = rd2d<b32_16x8, 16 * decltype(c)::value, 8 * I, uint8>(pq); });
+            };
+            load_a(std::integral_constant<int, 0>{});
             uint8 w[NB];
             float sb[NB];
-            const unsigned pb = pl2d<b32_16x8>(sbs, n0, s * 8);
+            pl2d_y(pb, s * 8);
             static_for<NB>([&](auto j) { w[j] = rd2d<b32_16x8, 16 * decltype(j)::value, 0, uint8>(pb); });
             // all SB loads first, then convert: converting each (bf16: via acc0) before the
             // next load let IGC reuse one load register and serialize the loads
             ushort2 sbr[(NB + 1) / 2];
-            const unsigned psb2 = pl2d<b16_32x1>(ssb, n0, s), psb1 = pl2d<b16_16x1>(ssb, n0, s);
+            pl2d_y(psb2, s);
+            pl2d_y(psb1, s);
             static_for<(NB + 1) / 2>([&](auto h) {
                 constexpr int J = 2 * decltype(h)::value;
                 if constexpr (J + 1 < NB) sbr[h] = rd2d<b16_32x1, 16 * J, 0, ushort2>(psb2);
@@ -329,31 +352,23 @@ struct GemmMT {
             });
 #pragma unroll
             for (int j = 0; j < NB; ++j) sb[j] = D::tof(sbr[j / 2][j % 2]);
-            const unsigned psa = pl2d<b16_16x1>(ssa, m0, s);
-            unsigned pq;
-            if constexpr (QMODE == 0) pq = pl2d<b16_2x16x8>(surf(Aq, K, M, K), s * GS / 2, m0);
-            else pq = pl2d<b32_16x8>(surf(A, K * 2, M, K * 2), s * GS / 2, m0);
             static_for<MB>([&](auto ii) {
                 constexpr int I = decltype(ii)::value;
+                if constexpr (I + 1 < MB) load_a(std::integral_constant<int, I + 1>{});
                 short8 aq[4];
                 float inv[8];
-                const float sal = D::tof(rd2d<b16_16x1, 8 * I, 0, unsigned short>(psa));
+                const float sal = D::tof(sar[I]);
                 if constexpr (QMODE == 0) {
-                    static_for<2>([&](auto hh) {
-                        constexpr int H = decltype(hh)::value;
-                        const ushort16 t = rd2d<b16_2x16x8, 32 * H, 8 * I, ushort16>(pq);
+#pragma unroll
+                    for (int h = 0; h < 2; ++h)
 #pragma unroll
                         for (int r = 0; r < 8; ++r) {
-                            aq[2 * H][r] = (short)t[r];
-                            aq[2 * H + 1][r] = (short)t[8 + r];
+                            aq[2 * h][r] = (short)ar[I][h][r];
+                            aq[2 * h + 1][r] = (short)ar[I][h][8 + r];
                         }
-                    });
                 } else {
-                    // all loads before the (volatile, so unreorderable) quant asm
-                    uint8 a[4];
-                    static_for<4>([&](auto c) { a[c] = rd2d<b32_16x8, 16 * decltype(c)::value, 8 * I, uint8>(pq); });
 #pragma unroll
-                    for (int c = 0; c < 4; ++c) aq[c] = quant8x32<BF16>(a[c], sal);
+                    for (int c = 0; c < 4; ++c) aq[c] = quant8x32<BF16>(ar[I][c], sal);
                 }
                 // rows >= M get inf here, but their int32 dot is 0 and the store clips them
 #pragma unroll

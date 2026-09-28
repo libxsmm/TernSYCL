@@ -93,9 +93,9 @@ struct Gemv {
         return acc;
     }
 
-    void load(const surf &sb, int m0, int n0, int s, unsigned *w, unsigned &sc, ushort8 *ar) const {
-        const unsigned pb = pl2d<b32_16x1>(sb, n0, s * 8);
-        static_for<8>([&](auto r) { w[r] = rd2d<b32_16x1, 0, decltype(r)::value, unsigned>(pb); });
+    // pb: B payload at block row 8 s0 (the step s = s0 + U0 is the immediate DY)
+    template <int U0> void load(unsigned pb, int m0, int n0, int s, unsigned *w, unsigned &sc, ushort8 *ar) const {
+        static_for<8>([&](auto r) { w[r] = rd2d<b32_16x1, 0, 8 * U0 + decltype(r)::value, unsigned>(pb); });
         sc = sg_rd_us(S + (size_t)s * N + n0);
 #pragma unroll
         for (int r = 0; r < SGM; ++r) {
@@ -118,6 +118,7 @@ struct Gemv {
         const int s_begin = sgk * per;
         const int s_end = sycl::min(nsteps, s_begin + per);
         const surf sb(B, N * 4, K / 16, N * 4);
+        unsigned pb = pl2d<b32_16x1>(sb, n0, 0);
 
         acc_t acc = 0.0f;
         if (n0 < N) {
@@ -126,8 +127,11 @@ struct Gemv {
             for (; s + U <= s_end; s += U) {
                 unsigned w[U][8], sc[U];
                 ushort8 ar[U][SGM];
-#pragma unroll
-                for (int u = 0; u < U; ++u) load(sb, m0, n0, s + u, w[u], sc[u], ar[u]);
+                pl2d_y(pb, s * 8);
+                static_for<U>([&](auto u) {
+                    constexpr int V = decltype(u)::value;
+                    load<V>(pb, m0, n0, s + V, w[V], sc[V], ar[V]);
+                });
 #pragma unroll
                 for (int u = 0; u < U; ++u) acc = step(acc, w[u], sc[u], ar[u]);
             }
@@ -135,7 +139,8 @@ struct Gemv {
                 for (; s < s_end; ++s) {
                     unsigned w[8], sc;
                     ushort8 ar[SGM];
-                    load(sb, m0, n0, s, w, sc, ar);
+                    pl2d_y(pb, s * 8);
+                    load<0>(pb, m0, n0, s, w, sc, ar);
                     acc = step(acc, w, sc, ar);
                 }
         }
@@ -206,10 +211,15 @@ struct GemmMT {
 #pragma unroll
         for (int i = 0; i < MB; ++i) an[i] = __builtin_bit_cast(short8, rd_16b_8r16(sa, 0, m0 + 8 * i));
 #endif
+        // 2D payloads built once; each K step only moves y (B) or x (A)
+        unsigned pb = pl2d<b32_16x8>(sb, n0, 0);
+#ifndef MT_APF
+        unsigned pa = pl2d<b16_16x8>(sa, 0, m0);
+#endif
         for (int s = 0; s < K / GS; ++s) {
             uint8 w[NB];
             unsigned s2[NB];
-            const unsigned pb = pl2d<b32_16x8>(sb, n0, s * 8);
+            pl2d_y(pb, s * 8);
             static_for<NB>([&](auto j) {
                 w[j] = rd2d<b32_16x8, 16 * decltype(j)::value, 0, uint8>(pb);
                 const unsigned sc = (n0 + 16 * j < N)
@@ -226,7 +236,7 @@ struct GemmMT {
                 for (int i = 0; i < MB; ++i)
                     an[i] = __builtin_bit_cast(short8, rd_16b_8r16(sa, s * GS + 16 * (c + 1), m0 + 8 * i));
 #else
-            const unsigned pa = pl2d<b16_16x8>(sa, s * GS, m0);
+            pl2d_x(pa, s * GS);
             static_for<8>([&](auto c) {
                 short8 a[MB];
                 static_for<MB>([&](auto i) {
