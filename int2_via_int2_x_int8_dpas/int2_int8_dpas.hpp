@@ -174,15 +174,16 @@ struct Gemv {
 #pragma unroll
         for (int r = 0; r < SGM; ++r) {
             const bool ok = m0 + r < M;
+            const size_t row = (size_t)sycl::min(m0 + r, M - 1) * K + s * GS;
             if constexpr (QMODE == 0) {
-                const ushort4 v = ok ? sg_rd_us4(
-                        (const unsigned short *)(Aq + (size_t)(m0 + r) * K + s * GS)) : ushort4{};
+                const ushort4 l = sg_rd_us4((const unsigned short *)(Aq + row));
+                const ushort4 v = ok ? l : ushort4{};
 #pragma unroll
                 for (int c = 0; c < 4; ++c) set_el<SGM>(aq[c], r, (short)v[c]);
                 inv[r] = ok ? sycl::native::recip(D::tof(SA[(size_t)s * lda + m0 + r])) : 0.0f;
             } else {
-                const uint4 v = ok ? sg_rd_u4(
-                        (const unsigned *)(A + (size_t)(m0 + r) * K + s * GS)) : uint4{};
+                const uint4 l = sg_rd_u4((const unsigned *)(A + row));
+                const uint4 v = ok ? l : uint4{};
                 const float sa = ok ? D::tof(SA[(size_t)s * lda + m0 + r]) : 0.0f;
 #pragma unroll
                 for (int c = 0; c < 4; ++c) set_el<SGM>(aq[c], r, q2<BF16>(v[c], sa));
@@ -219,6 +220,7 @@ struct Gemv {
         fa_t acc = 0.0f;
         if (n0 < N) {
             int s = s_begin;
+#pragma unroll 1
             for (; s + U <= s_end; s += U) {
                 uint8 w[U];
                 float sb[U];

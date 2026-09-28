@@ -192,8 +192,10 @@ struct Gemv {
                 const unsigned sc = sg_rd_us(sp + (k / GS) * (unsigned)N);
                 ushort4 ar[SGM];
 #pragma unroll
-                for (int r = 0; r < SGM; ++r)
-                    ar[r] = (SGM == 1 || m0 + r < M) ? sg_rd_us4(ap[r] + k) : ushort4{};
+                for (int r = 0; r < SGM; ++r) {
+                    const ushort4 v = sg_rd_us4(ap[r] + k);
+                    ar[r] = (SGM == 1 || m0 + r < M) ? v : ushort4{};
+                }
                 const unsigned r0 = rank, r1 = r0 + sycl::popcount(bm.x);
                 rank = r1 + sycl::popcount(bm.y);
                 const unsigned w0 = r0 >> 5;

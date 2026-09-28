@@ -98,10 +98,11 @@ struct Gemv {
         for (int r = 0; r < 8; ++r) w[r] = rd_32b_1r16(sb, n0, s * 8 + r);
         sc = sg_rd_us(S + (size_t)s * N + n0);
 #pragma unroll
-        for (int r = 0; r < SGM; ++r)
-            ar[r] = (SGM == 1 || m0 + r < M)
-                    ? sg_rd_us8(A + (size_t)(m0 + r) * K + s * GS)
-                    : ushort8{};
+        for (int r = 0; r < SGM; ++r) {
+            // group_load is convergent: load a valid row unconditionally, then select
+            const ushort8 v = sg_rd_us8(A + (size_t)sycl::min(m0 + r, M - 1) * K + s * GS);
+            ar[r] = (SGM == 1 || m0 + r < M) ? v : ushort8{};
+        }
     }
 
     void operator()(sycl::nd_item<2> it) const {
@@ -121,6 +122,7 @@ struct Gemv {
         acc_t acc = 0.0f;
         if (n0 < N) {
             int s = s_begin;
+#pragma unroll 1
             for (; s + U <= s_end; s += U) {
                 unsigned w[U][8], sc[U];
                 ushort8 ar[U][SGM];
@@ -239,18 +241,22 @@ struct GemmMT {
             }
         }
 
+        // fold over i: #pragma unroll gives up on MB inline-vISA store bodies, which
+        // leaves acc in private memory
+        [&]<int... I>(std::integer_sequence<int, I...>) {
+            ([&] {
 #pragma unroll
-        for (int i = 0; i < MB; ++i)
-#pragma unroll
-            for (int j = 0; j < NB; ++j) {
-                // barrier: otherwise IGC may fold the fp16 conversion into the K
-                // loop's accumulator chain and spill (seen in OpenCL at MT_M*MT_N >= 2048)
-                float8 v = acc[i][j];
+                for (int j = 0; j < NB; ++j) {
+                    // barrier: otherwise IGC may fold the fp16 conversion into the K
+                    // loop's accumulator chain and spill (seen in OpenCL at MT_M*MT_N >= 2048)
+                    float8 v = acc[I][j];
 #ifdef __SYCL_DEVICE_ONLY__
-                __asm__ volatile("" : "+rw"(v));
+                    __asm__ volatile("" : "+rw"(v));
 #endif
-                epi_dev<BF16>::store8x16(C, epi, M, N, m0 + 8 * i, n0 + 16 * j, v);
-            }
+                    epi_dev<BF16>::store8x16(C, epi, M, N, m0 + 8 * I, n0 + 16 * j, v);
+                }
+            }(), ...);
+        }(std::make_integer_sequence<int, MB>{});
     }
 
     auto get(syclex::properties_tag) const {

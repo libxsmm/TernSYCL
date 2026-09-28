@@ -65,7 +65,7 @@ struct surf {
                 "lsc_load_block2d.ugm (M1, 1) %0:" shape " flat[SB,SW,SH,SP,SX,SY]\n" \
                 "}\n"                                                              \
                 : "=rw"(v)                                                         \
-                : "rw"(s.base), "rw"(s.w), "rw"(s.h), "rw"(s.p), "rw"(x), "rw"(y)); \
+                : "rw.u"(s.base), "rw.u"(s.w), "rw.u"(s.h), "rw.u"(s.p), "rw.u"(x), "rw.u"(y)); \
         return v;                                                                  \
     }
 #define XE2_2D_WR(name, T, shape)                                                  \
@@ -79,7 +79,7 @@ struct surf {
                 ".decl SY v_type=G type=d num_elts=1 align=dword alias=<%5,0>\n"   \
                 "lsc_store_block2d.ugm (M1, 1) flat[SB,SW,SH,SP,SX,SY] %6:" shape "\n" \
                 "}\n"                                                              \
-                :: "rw"(s.base), "rw"(s.w), "rw"(s.h), "rw"(s.p), "rw"(x), "rw"(y), "rw"(v)); \
+                :: "rw.u"(s.base), "rw.u"(s.w), "rw.u"(s.h), "rw.u"(s.p), "rw.u"(x), "rw.u"(y), "rw"(v)); \
     }
 XE2_2D_RD(rd_32b_1r16, unsigned, "d32.16x1nn")
 XE2_2D_RD(rd_32b_2r16, uint2, "d32.16x2nn")
@@ -99,7 +99,7 @@ inline unsigned short rd_16b_1r16(const surf &s, int x, int y) {
             "mov (M1, 16) %0(0,0)<1> TP(0,0)<1;1,0>\n"
             "}\n"
             : "=rw"(v)
-            : "rw"(s.base), "rw"(s.w), "rw"(s.h), "rw"(s.p), "rw"(x), "rw"(y));
+            : "rw.u"(s.base), "rw.u"(s.w), "rw.u"(s.h), "rw.u"(s.p), "rw.u"(x), "rw.u"(y));
     return v;
 }
 // two adjacent 1x16 blocks = one 1x32 block: [0] = column x + lane, [1] = x + 16 + lane
@@ -112,35 +112,30 @@ XE2_2D_WR(wr_32b_8r16, uint8, "d32.16x8nn")
 #undef XE2_2D_RD
 #undef XE2_2D_WR
 
-// Sub-group block reads (group_load, striped: element i of lane l = p[l + 16 i]).
-// p must be 4-byte aligned and point to global memory.
-template <int N, typename T> inline void sg_load(const T *p, T (&o)[N]) {
+// Sub-group block reads, striped: element i of lane l = p[l + 16 i]; p must be
+// global and 4-byte aligned (16-byte for the vector forms). The scalar form is
+// group_load (a per-lane gather, as IGC emits for it); the vector forms are one
+// transposed LSC block load, whose dword order is the SIMD16 vector layout
+// (group_load lowers them to per-lane gathers).
+inline unsigned short sg_rd_us(const unsigned short *p) {
     namespace syclex = sycl::ext::oneapi::experimental;
     auto gp = sycl::address_space_cast<sycl::access::address_space::global_space,
             sycl::access::decorated::yes>(p).get_decorated();
-    syclex::group_load(sycl::ext::oneapi::this_work_item::get_sub_group(), gp, sycl::span<T, N>(o),
+    unsigned short o;
+    syclex::group_load(sycl::ext::oneapi::this_work_item::get_sub_group(), gp, o,
             syclex::properties{syclex::data_placement_striped, syclex::contiguous_memory, syclex::alignment<4>});
+    return o;
 }
-inline unsigned short sg_rd_us(const unsigned short *p) {
-    unsigned short o[1];
-    sg_load(p, o);
-    return o[0];
-}
-inline ushort4 sg_rd_us4(const unsigned short *p) {
-    unsigned short o[4];
-    sg_load(p, o);
-    return ushort4{o[0], o[1], o[2], o[3]};
-}
-inline ushort8 sg_rd_us8(const unsigned short *p) {
-    unsigned short o[8];
-    sg_load(p, o);
-    return ushort8{o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7]};
-}
-inline uint4 sg_rd_u4(const unsigned *p) {
-    unsigned o[4];
-    sg_load(p, o);
-    return uint4{o[0], o[1], o[2], o[3]};
-}
+#define XE2_BLK_RD(name, R, P, shape)                                                  \
+    inline R name(const P *p) {                                                         \
+        R v;                                                                            \
+        XE2_ASM("lsc_load.ugm (M1_NM, 1) %0:" shape " flat[%1]:a64" : "=rw"(v) : "rw"((long)p)); \
+        return v;                                                                       \
+    }
+XE2_BLK_RD(sg_rd_us4, ushort4, unsigned short, "d32x32t")
+XE2_BLK_RD(sg_rd_us8, ushort8, unsigned short, "d32x64t")
+XE2_BLK_RD(sg_rd_u4, uint4, unsigned, "d32x64t")
+#undef XE2_BLK_RD
 
 // per-lane 3-dword load, L1 and L3 cached
 inline uint3 ld_u3_cached(const uint3 *p) {
