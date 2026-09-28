@@ -112,6 +112,80 @@ XE2_2D_WR(wr_32b_8r16, uint8, "d32.16x8nn")
 #undef XE2_2D_RD
 #undef XE2_2D_WR
 
+// 2D block reads from a prebuilt address payload plus immediate (DX, DY) offsets,
+// as IGC emits for the builtins: one payload per surface and K step instead of
+// ~6 movs per load. The vISA text is built at compile time (asm((expr))).
+namespace detail {
+template <size_t N> struct cstr {
+    char s[N]{};
+    size_t n = 0;
+    constexpr size_t size() const { return n; }
+    constexpr const char *data() const { return s; }
+    constexpr void add(const char *p) { while (*p) s[n++] = *p++; }
+    constexpr void addi(int v) {
+        if (v < 0) { s[n++] = '-'; v = -v; }
+        char t[12];
+        int k = 0;
+        do { t[k++] = char('0' + v % 10); v /= 10; } while (v);
+        while (k) s[n++] = t[--k];
+    }
+};
+template <class SH, int DX, int DY> constexpr auto rd2d_str() {
+    cstr<320> c;
+    c.add("{\n.decl PD v_type=G type=ud num_elts=8 align=GRF alias=<%1,0>\n");
+    if constexpr (SH::pad) c.add(".decl TP v_type=G type=uw num_elts=32 align=GRF\n"
+                                 "lsc_load_block2d.ugm (M1, 1) TP:");
+    else c.add("lsc_load_block2d.ugm (M1, 1) %0:");
+    c.add(SH::v);
+    c.add(" flat[PD + (");
+    c.addi(DX);
+    c.add(",");
+    c.addi(DY);
+    c.add(")]\n");
+    if constexpr (SH::pad) c.add("mov (M1, 16) %0(0,0)<1> TP(0,0)<1;1,0>\n");
+    c.add("}\n");
+    return c;
+}
+}  // namespace detail
+
+// block shape: vISA type string and payload dword 7 = (V-1) << 16 | (R-1) << 8 | (C-1);
+// pad: the block is half a GRF but the load writes a whole (zero-padded) GRF
+struct b32_16x1 { static constexpr const char *v = "d32.16x1nn"; static constexpr int code = 0x00f; static constexpr bool pad = false; };
+struct b32_16x8 { static constexpr const char *v = "d32.16x8nn"; static constexpr int code = 0x70f; static constexpr bool pad = false; };
+struct b16_16x8 { static constexpr const char *v = "d16.16x8nn"; static constexpr int code = 0x70f; static constexpr bool pad = false; };
+struct b16_2x16x8 { static constexpr const char *v = "d16.2x16x8nn"; static constexpr int code = 0x1070f; static constexpr bool pad = false; };
+struct b16_32x1 { static constexpr const char *v = "d16.32x1nn"; static constexpr int code = 0x01f; static constexpr bool pad = false; };
+struct b16_16x1 { static constexpr const char *v = "d16.16x1nn"; static constexpr int code = 0x00f; static constexpr bool pad = true; };
+
+template <class SH> inline unsigned pl2d(const surf &s, int x, int y) {
+    unsigned pl;
+    XE2_ASM("{\n"
+            ".decl PQ v_type=G type=uq num_elts=4 align=GRF alias=<%0,0>\n"
+            ".decl PD v_type=G type=ud num_elts=8 align=GRF alias=<%0,0>\n"
+            "mov (M1_NM, 1) PQ(0,0)<1> %1(0,0)<0;1,0>\n"
+            "mov (M1_NM, 1) PD(0,2)<1> %2(0,0)<0;1,0>\n"
+            "mov (M1_NM, 1) PD(0,3)<1> %3(0,0)<0;1,0>\n"
+            "mov (M1_NM, 1) PD(0,4)<1> %4(0,0)<0;1,0>\n"
+            "mov (M1_NM, 1) PD(0,5)<1> %5(0,0)<0;1,0>\n"
+            "mov (M1_NM, 1) PD(0,6)<1> %6(0,0)<0;1,0>\n"
+            "mov (M1_NM, 1) PD(0,7)<1> %7(0,0)<0;1,0>\n"
+            "}\n"
+            : "=rw"(pl)
+            : "rw.u"(s.base), "rw.u"(s.w), "rw.u"(s.h), "rw.u"(s.p), "rw.u"(x), "rw.u"(y), "rw.u"(SH::code));
+    return pl;
+}
+template <class SH, int DX, int DY, class T> inline T rd2d(unsigned pl) {
+    T v;
+    XE2_ASM((detail::rd2d_str<SH, DX, DY>()) : "=rw"(v) : "rw"(pl));
+    return v;
+}
+
+// compile-time loop: f(std::integral_constant<int, I>) for I = 0..N-1
+template <int N, class F> inline void static_for(F &&f) {
+    [&]<int... I>(std::integer_sequence<int, I...>) { (f(std::integral_constant<int, I>{}), ...); }(
+            std::make_integer_sequence<int, N>{});
+}
+
 // Sub-group block reads, striped: element i of lane l = p[l + 16 i]; p must be
 // global and 4-byte aligned (16-byte for the vector forms). The scalar form is
 // group_load (a per-lane gather, as IGC emits for it); the vector forms are one

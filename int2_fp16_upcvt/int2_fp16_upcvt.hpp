@@ -94,8 +94,8 @@ struct Gemv {
     }
 
     void load(const surf &sb, int m0, int n0, int s, unsigned *w, unsigned &sc, ushort8 *ar) const {
-#pragma unroll
-        for (int r = 0; r < 8; ++r) w[r] = rd_32b_1r16(sb, n0, s * 8 + r);
+        const unsigned pb = pl2d<b32_16x1>(sb, n0, s * 8);
+        static_for<8>([&](auto r) { w[r] = rd2d<b32_16x1, 0, decltype(r)::value, unsigned>(pb); });
         sc = sg_rd_us(S + (size_t)s * N + n0);
 #pragma unroll
         for (int r = 0; r < SGM; ++r) {
@@ -131,12 +131,13 @@ struct Gemv {
 #pragma unroll
                 for (int u = 0; u < U; ++u) acc = step(acc, w[u], sc[u], ar[u]);
             }
-            for (; s < s_end; ++s) {
-                unsigned w[8], sc;
-                ushort8 ar[SGM];
-                load(sb, m0, n0, s, w, sc, ar);
-                acc = step(acc, w, sc, ar);
-            }
+            if constexpr (U > 1)
+                for (; s < s_end; ++s) {
+                    unsigned w[8], sc;
+                    ushort8 ar[SGM];
+                    load(sb, m0, n0, s, w, sc, ar);
+                    acc = step(acc, w, sc, ar);
+                }
         }
 
         if constexpr (LS > 1) {
@@ -208,13 +209,13 @@ struct GemmMT {
         for (int s = 0; s < K / GS; ++s) {
             uint8 w[NB];
             unsigned s2[NB];
-#pragma unroll
-            for (int j = 0; j < NB; ++j) {
-                w[j] = rd_32b_8r16(sb, n0 + 16 * j, s * 8);
+            const unsigned pb = pl2d<b32_16x8>(sb, n0, s * 8);
+            static_for<NB>([&](auto j) {
+                w[j] = rd2d<b32_16x8, 16 * decltype(j)::value, 0, uint8>(pb);
                 const unsigned sc = (n0 + 16 * j < N)
                         ? sg_rd_us(S + (size_t)s * N + n0 + 16 * j) : 0u;
                 s2[j] = sc | (sc << 16);
-            }
+            });
 #ifdef MT_APF
 #pragma unroll
             for (int c = 0; c < 8; ++c) {
@@ -225,20 +226,25 @@ struct GemmMT {
                 for (int i = 0; i < MB; ++i)
                     an[i] = __builtin_bit_cast(short8, rd_16b_8r16(sa, s * GS + 16 * (c + 1), m0 + 8 * i));
 #else
-#pragma unroll
-            for (int c = 0; c < 8; ++c) {
+            const unsigned pa = pl2d<b16_16x8>(sa, s * GS, m0);
+            static_for<8>([&](auto c) {
                 short8 a[MB];
-#pragma unroll
-                for (int i = 0; i < MB; ++i)
-                    a[i] = __builtin_bit_cast(short8, rd_16b_8r16(sa, s * GS + 16 * c, m0 + 8 * i));
+                static_for<MB>([&](auto i) {
+                    a[i] = __builtin_bit_cast(short8,
+                            rd2d<b16_16x8, 16 * decltype(c)::value, 8 * decltype(i)::value, ushort8>(pa));
+                });
 #endif
 #pragma unroll
                 for (int j = 0; j < NB; ++j) {
-                    const int8 b = dq_word(w[j][c], s2[j]);
+                    const int8 b = dq_word(w[j][(int)c], s2[j]);
 #pragma unroll
                     for (int i = 0; i < MB; ++i) acc[i][j] = mad_k16<BF16>(a[i], b, acc[i][j]);
                 }
+#ifdef MT_APF
             }
+#else
+            });
+#endif
         }
 
         // fold over i: #pragma unroll gives up on MB inline-vISA store bodies, which

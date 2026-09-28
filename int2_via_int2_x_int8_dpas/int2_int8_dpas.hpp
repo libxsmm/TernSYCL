@@ -235,6 +235,7 @@ struct Gemv {
 #pragma unroll
                 for (int u = 0; u < U; ++u) acc = step(acc, w[u], sb[u], aq[u], inv[u]);
             }
+            if constexpr (U > 1)
             for (; s < s_end; ++s) {
                 a_t aq[4];
                 float inv[SGM];
@@ -315,40 +316,42 @@ struct GemmMT {
         for (int s = 0; s < K / GS; ++s) {
             uint8 w[NB];
             float sb[NB];
-#pragma unroll
-            for (int j = 0; j < NB; ++j) w[j] = rd_32b_8r16(sbs, n0 + 16 * j, s * 8);
+            const unsigned pb = pl2d<b32_16x8>(sbs, n0, s * 8);
+            static_for<NB>([&](auto j) { w[j] = rd2d<b32_16x8, 16 * decltype(j)::value, 0, uint8>(pb); });
             // all SB loads first, then convert: converting each (bf16: via acc0) before the
             // next load let IGC reuse one load register and serialize the loads
             ushort2 sbr[(NB + 1) / 2];
-#pragma unroll
-            for (int j = 0; j < NB; j += 2)
-                sbr[j / 2] = j + 1 < NB ? rd_16b_1r16x2(ssb, n0 + 16 * j, s)
-                                        : ushort2{rd_16b_1r16(ssb, n0 + 16 * j, s), 0};
+            const unsigned psb2 = pl2d<b16_32x1>(ssb, n0, s), psb1 = pl2d<b16_16x1>(ssb, n0, s);
+            static_for<(NB + 1) / 2>([&](auto h) {
+                constexpr int J = 2 * decltype(h)::value;
+                if constexpr (J + 1 < NB) sbr[h] = rd2d<b16_32x1, 16 * J, 0, ushort2>(psb2);
+                else sbr[h] = ushort2{rd2d<b16_16x1, 16 * J, 0, unsigned short>(psb1), 0};
+            });
 #pragma unroll
             for (int j = 0; j < NB; ++j) sb[j] = D::tof(sbr[j / 2][j % 2]);
-#pragma unroll
-            for (int i = 0; i < MB; ++i) {
-                const int mr = m0 + 8 * i;
+            const unsigned psa = pl2d<b16_16x1>(ssa, m0, s);
+            unsigned pq;
+            if constexpr (QMODE == 0) pq = pl2d<b16_2x16x8>(surf(Aq, K, M, K), s * GS / 2, m0);
+            else pq = pl2d<b32_16x8>(surf(A, K * 2, M, K * 2), s * GS / 2, m0);
+            static_for<MB>([&](auto ii) {
+                constexpr int I = decltype(ii)::value;
                 short8 aq[4];
                 float inv[8];
-                const float sal = D::tof(rd_16b_1r16(ssa, mr, s));
+                const float sal = D::tof(rd2d<b16_16x1, 8 * I, 0, unsigned short>(psa));
                 if constexpr (QMODE == 0) {
-                    const surf saq(Aq, K, M, K);
-#pragma unroll
-                    for (int h = 0; h < 2; ++h) {
-                        const ushort16 t = rd_16b_8r16x2(saq, s * GS / 2 + 32 * h, mr);
+                    static_for<2>([&](auto hh) {
+                        constexpr int H = decltype(hh)::value;
+                        const ushort16 t = rd2d<b16_2x16x8, 32 * H, 8 * I, ushort16>(pq);
 #pragma unroll
                         for (int r = 0; r < 8; ++r) {
-                            aq[2 * h][r] = (short)t[r];
-                            aq[2 * h + 1][r] = (short)t[8 + r];
+                            aq[2 * H][r] = (short)t[r];
+                            aq[2 * H + 1][r] = (short)t[8 + r];
                         }
-                    }
+                    });
                 } else {
-                    const surf sa(A, K * 2, M, K * 2);
                     // all loads before the (volatile, so unreorderable) quant asm
                     uint8 a[4];
-#pragma unroll
-                    for (int c = 0; c < 4; ++c) a[c] = rd_32b_8r16(sa, s * GS / 2 + 16 * c, mr);
+                    static_for<4>([&](auto c) { a[c] = rd2d<b32_16x8, 16 * decltype(c)::value, 8 * I, uint8>(pq); });
 #pragma unroll
                     for (int c = 0; c < 4; ++c) aq[c] = quant8x32<BF16>(a[c], sal);
                 }
@@ -365,9 +368,9 @@ struct GemmMT {
                     // are emitted through one scratch register and stall every mad
                     const float8 fi = __builtin_convertvector(ia, float8);
 #pragma unroll
-                    for (int r = 0; r < 8; ++r) acc[i][j][r] += fi[r] * (sb[j] * inv[r]);
+                    for (int r = 0; r < 8; ++r) acc[I][j][r] += fi[r] * (sb[j] * inv[r]);
                 }
-            }
+            });
         }
 
 #pragma unroll
