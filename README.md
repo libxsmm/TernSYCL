@@ -24,13 +24,18 @@ GEMV: `K % (64 * LS) == 0`).
 
 ## How the kernels are written
 
-Plain SIMT SYCL (sub-group size 16), using the same IGC builtins as the OpenCL
-kernels, declared in [common/xe2.hpp](common/xe2.hpp):
+Plain SIMT SYCL (sub-group size 16). The Xe2 instructions are inline-vISA
+helpers in [common/xe2.hpp](common/xe2.hpp), with no OpenCL or IGC builtins:
 
-* DPAS: `intel_sub_group_{f16_f16,bf16_bf16}_matrix_mad_k16`,
-  `intel_sub_group_i8_i2_matrix_mad_k32` (OpenCL mangling, resolved by IGC).
-* 2D block I/O: `__builtin_IB_subgroup_block_read_flat_*` / `..._write_flat_*`.
-* Sub-group block reads: `intel_sub_group_block_read{,4,_us,_us4,_us8}`.
+* DPAS: `dpas_hf` / `dpas_bf` (fp16 / bf16, K16) and `dpas_s2s8` (int2
+  weights x int8 activations, K32).
+* 2D block I/O: `pl2d<shape>()` builds the address payload once per kernel,
+  `pl2d_x` / `pl2d_y` move it per K step, and `rd2d<shape, DX, DY>()` reads
+  at immediate block offsets (`lsc_load_block2d`), as IGC emits for its
+  builtins. Explicit-surface forms (`rd_32b_8r16`, `wr_16b_8r16`, ...) cover
+  the epilogue and the one-off reads.
+* Sub-group block reads: `sg_rd_us{,4,8}`, `sg_rd_u4` (transposed
+  `lsc_load ... d32xNt` from a uniform address).
 * The int8 large-M kernel quantizes A with XeTLA's instruction sequence as
   inline vISA, as in TernOCL; the BITCOS kernels apply the fp16 scale with
   XeTLA's two SIMD32 `hf` multiplies as inline vISA (`--int-apply` and
@@ -53,7 +58,7 @@ SIMT one; it is not part of the repo.
 ## Layout
 
 ```
-common/            xe2.hpp (Xe2 builtins, 2D surfaces, dtype conversion), epilogue_dev.hpp (device
+common/            xe2.hpp (inline-vISA DPAS / block I/O, 2D surfaces, dtype conversion), epilogue_dev.hpp (device
                    epilogues), epilogue.hpp / dt16.hpp (host epilogue, fp16/bf16, compare), driver.hpp
 int2_fp16_upcvt/   kernels (int2_fp16_upcvt.hpp), driver, Makefile, validate.sh, bench.sh
 int2_via_int2_x_int8_dpas/
@@ -93,9 +98,6 @@ for benchmarking: with the JIT path (`JIT=1`), the bf16 kernels run slower and
 switch between two speeds from process to process (e.g. 52 vs 72 us for the
 27B down GEMV), and the slow state carries over to kernels loaded later in the
 same process. The AOT binaries have bf16 = fp16 and are stable.
-
-The link step warns about "Undefined function intel_sub_group_..." for each
-builtin; IGC resolves them when it compiles the SPIR-V.
 
 ## Validate and benchmark
 
@@ -244,11 +246,28 @@ Same build and methodology, `PACE=15`, both drivers pinned to E-core 4.
 
 ## SYCL codegen notes
 
-* **Builtins:** OpenCL-named builtins must match the OpenCL mangling
-  (`ext_vector_type` vectors, `opencl_global` pointers). `__builtin_IB_*` are
-  declared `extern "C"`.
 * **Inline vISA:** works in SIMT SYCL. Guard the `asm` with
   `__SYCL_DEVICE_ONLY__`, because the host pass rejects the `rw` constraint.
+  IGC does not reorder the asm, so it has to match what IGC emits for its
+  builtins, or it is slower:
+  * Uniform scalars (2D surface fields, coordinates) take `rw.u`; per-lane
+    `rw` broadcasts them to 16 lanes. A send address is copied into a
+    GRF-aligned `.decl` temp (a `rw.u` scalar may sit mid-register).
+  * Immediates (2D block offsets) are spliced into the asm text at compile
+    time (`asm((constexpr string))`); the `i` constraint emits `0x0:d` and
+    `%c` drops the asm.
+  * Results smaller than a GRF (16x1 d16 2D reads, `d32x8t`) go through a
+    GRF temp: the load writes the whole register.
+  * Build each 2D payload once and update x / y per K step. Rebuilding it per
+    load costs ~6 `mov`s each and makes the payloads share one register,
+    which serializes the loads.
+  * Loads issue in source order: put the latency-critical ones first (the
+    int8 large-M A block before B and the scales).
+  * `group_load` lowers vector sub-group reads to per-lane gathers; use the
+    transposed LSC load.
+  * LLVM treats asm as cheap: `#pragma unroll 1` on the K loops, an
+    `if constexpr` remainder loop, and a fold over the row blocks in the
+    epilogue (a partial unroll left the accumulators in memory).
 * **`-foffload-fp32-prec-div`:** with it, IGC's vectorizer miscompiles the
   uniform `native::recip(group_broadcast(x, r))` (rows 1..7 are dropped).
   Without it, `native::recip` is `math.inv` and the kernels validate.
