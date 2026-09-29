@@ -208,15 +208,21 @@ template <int N, class F> inline void static_for(F &&f) {
 inline unsigned short sg_rd_us(const unsigned short *p) {
     unsigned short v;
     XE2_ASM("{\n.decl TP v_type=G type=uw num_elts=32 align=GRF\n"
-            "lsc_load.ugm (M1_NM, 1) TP:d32x8t flat[%1]:a64\n"
+            ".decl AD v_type=G type=q num_elts=1 align=GRF\n"
+            "mov (M1_NM, 1) AD(0,0)<1> %1(0,0)<0;1,0>\n"
+            "lsc_load.ugm (M1_NM, 1) TP:d32x8t flat[AD]:a64\n"
             "mov (M1, 16) %0(0,0)<1> TP(0,0)<1;1,0>\n}\n"
-            : "=rw"(v) : "rw"((long)p));
+            : "=rw"(v) : "rw.u"((long)p));
     return v;
 }
+// the send address must start a GRF: a uniform scalar is copied into an aligned temp
 #define XE2_BLK_RD(name, R, P, shape)                                                  \
     inline R name(const P *p) {                                                         \
         R v;                                                                            \
-        XE2_ASM("lsc_load.ugm (M1_NM, 1) %0:" shape " flat[%1]:a64" : "=rw"(v) : "rw"((long)p)); \
+        XE2_ASM("{\n.decl AD v_type=G type=q num_elts=1 align=GRF\n"                  \
+                "mov (M1_NM, 1) AD(0,0)<1> %1(0,0)<0;1,0>\n"                           \
+                "lsc_load.ugm (M1_NM, 1) %0:" shape " flat[AD]:a64\n}\n"              \
+                : "=rw"(v) : "rw.u"((long)p));                                         \
         return v;                                                                       \
     }
 XE2_BLK_RD(sg_rd_us4, ushort4, unsigned short, "d32x32t")

@@ -220,10 +220,10 @@ struct GemmMT {
             uint8 w[NB];
             unsigned s2[NB];
             pl2d_y(pb, s * 8);
+            const unsigned short *sp = S + (size_t)s * N + n0;
             static_for<NB>([&](auto j) {
                 w[j] = rd2d<b32_16x8, 16 * decltype(j)::value, 0, uint8>(pb);
-                const unsigned sc = (n0 + 16 * j < N)
-                        ? sg_rd_us(S + (size_t)s * N + n0 + 16 * j) : 0u;
+                const unsigned sc = (n0 + 16 * j < N) ? sg_rd_us(sp + 16 * j) : 0u;
                 s2[j] = sc | (sc << 16);
             });
 #ifdef MT_APF
