@@ -35,12 +35,13 @@ XE2_VEC(float, 4, float4);
 XE2_VEC(float, 8, float8);
 #undef XE2_VEC
 
-// 2D surface: width and pitch in bytes, height in rows
+// 2D surface: width and pitch in bytes, height in rows. Addresses are long long:
+// long is 32 bits in SYCL device code on Windows (LLP64) and would truncate them
 struct surf {
-    long base;
+    long long base;
     int w, h, p;
     surf(const void *b, int width_bytes, int height, int pitch_bytes)
-        : base((long)b), w(width_bytes - 1), h(height - 1), p(pitch_bytes - 1) {}
+        : base((long long)b), w(width_bytes - 1), h(height - 1), p(pitch_bytes - 1) {}
 };
 
 #ifdef __SYCL_DEVICE_ONLY__
@@ -218,7 +219,7 @@ inline unsigned short sg_rd_us(const unsigned short *p) {
             "mov (M1_NM, 1) AD(0,0)<1> %1(0,0)<0;1,0>\n"
             "lsc_load.ugm (M1_NM, 1) TP:d32x8t flat[AD]:a64\n"
             "mov (M1, 16) %0(0,0)<1> TP(0,0)<1;1,0>\n}\n"
-            : "=rw"(v) : "rw.u"((long)p));
+            : "=rw"(v) : "rw.u"((long long)p));
     return v;
 }
 // the send address must start a GRF: a uniform scalar is copied into an aligned temp
@@ -228,7 +229,7 @@ inline unsigned short sg_rd_us(const unsigned short *p) {
         XE2_ASM("{\n.decl AD v_type=G type=q num_elts=1 align=GRF\n"                  \
                 "mov (M1_NM, 1) AD(0,0)<1> %1(0,0)<0;1,0>\n"                           \
                 "lsc_load.ugm (M1_NM, 1) %0:" shape " flat[AD]:a64\n}\n"              \
-                : "=rw"(v) : "rw.u"((long)p));                                         \
+                : "=rw"(v) : "rw.u"((long long)p));                                    \
         return v;                                                                       \
     }
 XE2_BLK_RD(sg_rd_us4, ushort4, unsigned short, "d32x32t")
@@ -239,7 +240,7 @@ XE2_BLK_RD(sg_rd_u4, uint4, unsigned, "d32x64t")
 // per-lane 3-dword load, L1 and L3 cached
 inline uint3 ld_u3_cached(const uint3 *p) {
     uint3 v;
-    XE2_ASM("lsc_load.ugm.ca.ca (M1, 16) %0:d32x3 flat[%1]:a64" : "=rw"(v) : "rw"((long)p));
+    XE2_ASM("lsc_load.ugm.ca.ca (M1, 16) %0:d32x3 flat[%1]:a64" : "=rw"(v) : "rw"((long long)p));
     return v;
 }
 
