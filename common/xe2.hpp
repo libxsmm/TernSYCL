@@ -21,6 +21,8 @@ XE2_VEC(unsigned short, 2, ushort2);
 XE2_VEC(unsigned short, 4, ushort4);
 XE2_VEC(unsigned short, 8, ushort8);
 XE2_VEC(unsigned short, 16, ushort16);
+XE2_VEC(unsigned short, 32, ushort32);
+XE2_VEC(unsigned short, 64, ushort64);
 XE2_VEC(int, 2, int2);
 XE2_VEC(int, 4, int4);
 XE2_VEC(int, 8, int8);
@@ -154,6 +156,10 @@ struct b32_16x1 { static constexpr const char *v = "d32.16x1nn"; static constexp
 struct b32_16x8 { static constexpr const char *v = "d32.16x8nn"; static constexpr int code = 0x70f; static constexpr bool pad = false; };
 struct b16_16x8 { static constexpr const char *v = "d16.16x8nn"; static constexpr int code = 0x70f; static constexpr bool pad = false; };
 struct b16_2x16x8 { static constexpr const char *v = "d16.2x16x8nn"; static constexpr int code = 0x1070f; static constexpr bool pad = false; };
+struct b16_16x16 { static constexpr const char *v = "d16.16x16nn"; static constexpr int code = 0xf0f; static constexpr bool pad = false; };
+struct b16_2x16x16 { static constexpr const char *v = "d16.2x16x16nn"; static constexpr int code = 0x10f0f; static constexpr bool pad = false; };
+struct b16_16x32 { static constexpr const char *v = "d16.16x32nn"; static constexpr int code = 0x1f0f; static constexpr bool pad = false; };
+struct b16_2x16x32 { static constexpr const char *v = "d16.2x16x32nn"; static constexpr int code = 0x11f0f; static constexpr bool pad = false; };
 struct b16_32x1 { static constexpr const char *v = "d16.32x1nn"; static constexpr int code = 0x01f; static constexpr bool pad = false; };
 struct b16_16x1 { static constexpr const char *v = "d16.16x1nn"; static constexpr int code = 0x00f; static constexpr bool pad = true; };
 
@@ -306,6 +312,28 @@ template <> struct dt<true> {
 template <bool BF16, typename A, typename C> inline C mad_k16(A a, int8 b, C acc) {
     if constexpr (BF16) return dpas_bf(a, b, acc);
     else return dpas_hf(a, b, acc);
+}
+
+namespace detail {
+template <bool BF16, int NA, int ROW> constexpr auto dpas_at_str() {
+    cstr<300> c;
+    c.add("{\n.decl DB v_type=G type=ud num_elts=128 align=GRF alias=<%1,0>\n"
+          ".decl DA v_type=G type=ud num_elts=");
+    c.addi(NA);
+    c.add(" align=GRF alias=<%2,0>\ndpas.");
+    c.add(BF16 ? "bf.bf" : "hf.hf");
+    c.add(".8.8 (M1, 16) %0.0 %0.0 DB.0 DA(");
+    c.addi(ROW);
+    c.add(",0)\n}\n");
+    return c;
+}
+}  // namespace detail
+
+// 8-row DPAS whose A operand starts at GRF row ROW of a larger A block (e.g. a
+// 32-row x 2-block 2D read), aliased in place as IGC does for the builtins
+template <bool BF16, int ROW, class AV> inline float8 mad8_at(const AV &a, int8 b, float8 acc) {
+    XE2_ASM((detail::dpas_at_str<BF16, (int)sizeof(AV) * 4, ROW>()) : "+rw"(acc) : "rw"(b), "rw"(a));
+    return acc;
 }
 
 }  // namespace xe2

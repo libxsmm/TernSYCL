@@ -92,8 +92,9 @@ struct RunConfig {
     double weights_gib = 2.0;
     int sgm = 0, nsg = 0, ls = 0, u = 0;  // 0 = default dispatch
     // large-M kernel: sub-group tile mt_m x mt_n, work-group wg_m x wg_n
-    // sub-groups; used when mt_m > 0 or M >= 64
-    int mt_m = 0, mt_n = 16, wg_m = 2, wg_n = 4;
+    // sub-groups; used when mt_m > 0 or M >= 64. Default = TernOCL's most
+    // common best on the B70 at M = 1024 (select decode).
+    int mt_m = 0, mt_n = 32, wg_m = 4, wg_n = 4;
     Epilogue epi;
 };
 
@@ -126,14 +127,19 @@ static void default_tiles(RunConfig &c) {
     int wgn = 64, ls = 1, u = 2;
     if (c.m == 1) {
         const int K = c.k, N = c.n;
-        if (K == 5120 && N == 34816)       { wgn = 16; ls = 4; u = 2; }  // gate_up
-        else if (K == 17408 && N == 5120)  { wgn = 32; ls = 4; u = 2; }  // down
-        else if (K == 5120 && N == 16384)  { wgn = 16; ls = 2; u = 1; }  // in_proj_qkvz
-        else if (K == 6144 && N == 5120)   { wgn = 32; ls = 6; u = 1; }  // out_proj
+        if (K == 5120 && N == 34816)       { wgn = 32; ls = 8; u = 1; }  // gate_up
+        else if (K == 17408 && N == 5120)  { wgn = 16; ls = 6; u = 1; }  // down
+        else if (K == 5120 && N == 16384)  { wgn = 32; ls = 2; u = 1; }  // in_proj_qkvz
+        else if (K == 6144 && N == 5120)   { wgn = 16; ls = 6; u = 1; }  // out_proj
         else if (K == 5120 && N == 14336)  { wgn = 32; ls = 2; u = 1; }  // qkv
-        else if (K == 5120 && N == 248320) { wgn = 16; ls = 4; u = 2; }  // lm_head
-        else if (N <= 8192)                { wgn = 32; ls = 4; u = 2; }
-        else                               { wgn = 16; ls = 2; u = 1; }
+        else if (K == 5120 && N == 248320) { wgn = 16; ls = 1; u = 1; }  // lm_head
+        else if (K == 4096 && N == 6144)   { wgn = 16; ls = 4; u = 1; }  // 8B qkv
+        else if (K == 4096 && N == 4096)   { wgn = 32; ls = 8; u = 1; }  // 8B o_proj
+        else if (K == 4096 && N == 24576)  { wgn = 64; ls = 1; u = 1; }  // 8B gate_up
+        else if (K == 12288 && N == 4096)  { wgn = 32; ls = 8; u = 1; }  // 8B down
+        else if (K == 4096 && N == 151680) { wgn = 32; ls = 1; u = 1; }  // 8B lm_head
+        else if (N <= 8192)                { wgn = 32; ls = 4; u = 1; }
+        else                               { wgn = 32; ls = 2; u = 1; }
     }
     if (c.nsg == 0) c.nsg = wgn / 16;
     if (c.ls == 0) c.ls = ls;
@@ -167,7 +173,12 @@ static void run(RunConfig cfg) {
 
     sycl::queue q = make_queue();
     std::cout << "Problem: M=" << M << " N=" << N << " K=" << K << " scale_gs=" << kGS
-              << " dtype=" << dt_name() << " epilogue=" << cfg.epi.name() << "\n";
+              << " dtype=" << dt_name() << " epilogue=" << cfg.epi.name()
+#ifdef INT_DQ
+              << " decode=int\n";
+#else
+              << " decode=sel\n";
+#endif
     if (mt)
         std::cout << "Tile (mt): sg " << cfg.mt_m << "x" << cfg.mt_n << ", wg " << cfg.wg_m
                   << "x" << cfg.wg_n << " sub-groups, 256 GRF\n";

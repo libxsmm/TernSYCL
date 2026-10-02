@@ -28,7 +28,8 @@ Plain SIMT SYCL (sub-group size 16). The Xe2 instructions are inline-vISA
 helpers in [common/xe2.hpp](common/xe2.hpp), with no OpenCL or IGC builtins:
 
 * DPAS: `dpas_hf` / `dpas_bf` (fp16 / bf16, K16) and `dpas_s2s8` (int2
-  weights x int8 activations, K32).
+  weights x int8 activations, K32); `mad8_at<BF16, ROW>` takes its 8-row A
+  operand at GRF row `ROW` of a larger 2D read, aliased in place.
 * 2D block I/O: `pl2d<shape>()` builds the address payload once per kernel,
   `pl2d_x` / `pl2d_y` move it per K step, and `rd2d<shape, DX, DY>()` reads
   at immediate block offsets (`lsc_load_block2d`), as IGC emits for its
@@ -36,6 +37,14 @@ helpers in [common/xe2.hpp](common/xe2.hpp), with no OpenCL or IGC builtins:
   the epilogue and the one-off reads.
 * Sub-group block reads: `sg_rd_us{,4,8}`, `sg_rd_u4` (transposed
   `lsc_load ... d32xNt` from a uniform address).
+* The int2 upcvt kernels build each DPAS B register from the XeTLA codes with
+  predicated selects, as TernOCL: a SIMD32 `and.nz` on each lane's half-word
+  (region `<2;2,0>`) against alternating bit masks gives the sign and nonzero
+  predicates, then `(Ps) sel -s,+s` and `(~Pz) mov 0` (4 instructions per
+  register instead of ~10; `make INT_DQ=1` builds XeTLA's integer decode).
+  The large-M kernel reads A in 32-row x 32-K blocks (16 K for MT_M > 64)
+  and issues the first K-step's A reads ahead of the B and scale reads, as
+  TernOCL's schedule does (issuing them after the decode cost 3-6% at 64x32).
 * The int8 large-M kernel quantizes A with XeTLA's instruction sequence as
   inline vISA, as in TernOCL; the BITCOS kernels apply the fp16 scale with
   XeTLA's two SIMD32 `hf` multiplies as inline vISA (`--int-apply` and
@@ -164,21 +173,24 @@ TernOCL vs TernSYCL on the same card (AOT build, oneAPI 2026.0, GPU runtime
 26.35). GEMV is M = 1, GEMM is M = 1024. SYCL/OCL > 1 means TernSYCL is
 faster. The int8 times include the activation-quantization pre-kernel.
 
-**int2_fp16_upcvt**
+**int2_fp16_upcvt** (select decode, both sides; TernOCL `e08580c`)
 
 | shape | K x N | GEMV OCL (us) | GEMV SYCL (us) | SYCL/OCL | GEMM OCL (ms) | GEMM SYCL (ms) | SYCL/OCL |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 8B.qkv | 4096 x 6144 | 17.4 | 16.6 | x1.05 | 0.452 | 0.455 | x0.99 |
-| 8B.o_proj | 4096 x 4096 | 11.8 | 12.2 | x0.96 | 0.310 | 0.313 | x0.99 |
-| 8B.gate_up | 4096 x 24576 | 57.0 | 57.1 | x1.00 | 1.875 | 1.859 | x1.01 |
-| 8B.down | 12288 x 4096 | 29.6 | 28.7 | x1.03 | 0.900 | 0.881 | x1.02 |
-| 8B.lm_head | 4096 x 151680 | 363.4 | 356.3 | x1.02 | 11.944 | 11.694 | x1.02 |
-| 27B.gate_up | 5120 x 34816 | 110.7 | 107.3 | x1.03 | 3.388 | 3.345 | x1.01 |
-| 27B.down | 17408 x 5120 | 51.8 | 52.1 | x0.99 | 1.817 | 1.797 | x1.01 |
-| 27B.qkvz | 5120 x 16384 | 46.4 | 45.9 | x1.01 | 1.498 | 1.503 | x1.00 |
-| 27B.out_proj | 6144 x 5120 | 20.7 | 20.4 | x1.01 | 0.657 | 0.643 | x1.02 |
-| 27B.qkv | 5120 x 14336 | 41.2 | 41.8 | x0.99 | 1.311 | 1.295 | x1.01 |
-| 27B.lm_head | 5120 x 248320 | 725.2 | 704.3 | x1.03 | 25.486 | 25.068 | x1.02 |
+| 8B.qkv | 4096 x 6144 | 14.4 | 13.4 | x1.08 | 0.375 | 0.376 | x1.00 |
+| 8B.o_proj | 4096 x 4096 | 10.4 | 9.7 | x1.07 | 0.257 | 0.256 | x1.01 |
+| 8B.gate_up | 4096 x 24576 | 47.2 | 46.6 | x1.01 | 1.465 | 1.502 | x0.98 |
+| 8B.down | 12288 x 4096 | 25.2 | 24.5 | x1.03 | 0.733 | 0.730 | x1.00 |
+| 8B.lm_head | 4096 x 151680 | 278.6 | 278.0 | x1.00 | 9.598 | 9.625 | x1.00 |
+| 27B.gate_up | 5120 x 34816 | 86.8 | 83.6 | x1.04 | 2.619 | 2.660 | x0.98 |
+| 27B.down | 17408 x 5120 | 42.7 | 41.8 | x1.02 | 1.375 | 1.326 | x1.04 |
+| 27B.qkvz | 5120 x 16384 | 40.1 | 39.3 | x1.02 | 1.261 | 1.250 | x1.01 |
+| 27B.out_proj | 6144 x 5120 | 17.1 | 16.2 | x1.05 | 0.483 | 0.507 | x0.95 |
+| 27B.qkv | 5120 x 14336 | 35.6 | 34.7 | x1.03 | 1.053 | 1.046 | x1.01 |
+| 27B.lm_head | 5120 x 248320 | 571.3 | 572.3 | x1.00 | 20.170 | 20.187 | x1.00 |
+
+27B.out_proj M=1024 is tile-sweep noise. On one card, alternating median of 3,
+every tile lands at 0.50-0.52 ms for both, and SYCL/OCL is x0.97-x1.08 per tile.
 
 **int2_via_int2_x_int8_dpas, qmode 0 (A quantized to int8 upfront)**
 
@@ -243,6 +255,46 @@ Same build and methodology, `PACE=15`, both drivers pinned to E-core 4.
 | 27B.out_proj | 6144 x 5120 | 116.4 | 113.7 | x1.02 | 2.858 | 2.827 | x1.01 |
 | 27B.qkv | 5120 x 14336 | 226.6 | 228.0 | x0.99 | 6.272 | 6.103 | x1.03 |
 | 27B.lm_head | 5120 x 248320 | 3766.8 | 3759.0 | x1.00 | 115.969 | 115.416 | x1.00 |
+
+The LNL upcvt numbers predate the select decode.
+
+## Current vs previous main (B70, fp16)
+
+This tree (inline vISA + int2 select decode) vs main at 5e162d8 (IGC
+builtins, integer decode), same card, each with its best tile from the same
+sweep, alternating runs, median of 3. Speed = 5e162d8 time / current time.
+
+**int2_fp16_upcvt**
+
+| shape | M=1 5e162d8 (us) | M=1 now (us) | speed | M=1024 5e162d8 (ms) | M=1024 now (ms) | speed |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8B.qkv | 16.6 | 13.3 | x1.24 | 0.457 | 0.384 | x1.19 |
+| 8B.o_proj | 12.0 | 9.7 | x1.24 | 0.307 | 0.258 | x1.19 |
+| 8B.gate_up | 57.2 | 47.4 | x1.21 | 1.846 | 1.537 | x1.20 |
+| 8B.down | 28.9 | 24.5 | x1.18 | 0.901 | 0.724 | x1.24 |
+| 8B.lm_head | 348.8 | 279.2 | x1.25 | 12.106 | 9.835 | x1.23 |
+| 27B.gate_up | 107.1 | 83.8 | x1.28 | 3.293 | 2.644 | x1.25 |
+| 27B.down | 52.1 | 41.9 | x1.24 | 1.800 | 1.331 | x1.35 |
+| 27B.qkvz | 46.0 | 39.4 | x1.17 | 1.507 | 1.249 | x1.21 |
+| 27B.out_proj | 20.5 | 16.2 | x1.26 | 0.636 | 0.493 | x1.29 |
+| 27B.qkv | 41.8 | 34.9 | x1.20 | 1.299 | 1.057 | x1.23 |
+| 27B.lm_head | 705.1 | 569.3 | x1.24 | 25.387 | 20.990 | x1.21 |
+
+**int2_via_int2_x_int8_dpas** (M=1 is at the bandwidth limit for both: x0.98-x1.00)
+
+| shape | M=1024 qm0 5e162d8 (ms) | M=1024 qm0 now (ms) | speed | M=1024 qm1 5e162d8 (ms) | M=1024 qm1 now (ms) | speed |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8B.qkv | 0.240 | 0.233 | x1.03 | 0.295 | 0.299 | x0.99 |
+| 8B.o_proj | 0.174 | 0.167 | x1.04 | 0.200 | 0.207 | x0.97 |
+| 8B.gate_up | 0.941 | 0.864 | x1.09 | 1.152 | 1.151 | x1.00 |
+| 8B.down | 0.510 | 0.464 | x1.10 | 0.585 | 0.576 | x1.02 |
+| 8B.lm_head | 6.436 | 5.491 | x1.17 | 7.082 | 7.107 | x1.00 |
+| 27B.gate_up | 1.673 | 1.532 | x1.09 | 1.926 | 1.926 | x1.00 |
+| 27B.down | 0.873 | 0.814 | x1.07 | 1.020 | 1.005 | x1.01 |
+| 27B.qkvz | 0.753 | 0.730 | x1.03 | 0.909 | 0.907 | x1.00 |
+| 27B.out_proj | 0.309 | 0.291 | x1.06 | 0.360 | 0.367 | x0.98 |
+| 27B.qkv | 0.649 | 0.593 | x1.09 | 0.789 | 0.783 | x1.01 |
+| 27B.lm_head | 13.606 | 12.108 | x1.12 | 15.601 | 15.568 | x1.00 |
 
 ## Inline vISA vs IGC builtins (before / after)
 

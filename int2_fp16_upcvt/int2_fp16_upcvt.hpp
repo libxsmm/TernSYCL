@@ -11,9 +11,15 @@
 //   C : DT (or fp32) [M, N]
 //
 // DT is fp16 or bf16 (template parameter BF16). Codes are {0, 1, 3} =
-// {0, +1, -1}. As in xetla, the scale is folded into the upconvert with
-// integer ops only -- (scale ^ sign) & magnitude -- so the B tile comes out in
-// DT and goes straight into the DT DPAS, fp32 accumulate.
+// {0, +1, -1}. Each DPAS B register is built from the codes by predicated
+// selects (inline vISA, same weight layout as xetla): register c, read as 32
+// 16-bit channels, is channel j = (column j/2, row 2c + (j & 1)); a SIMD32
+// and.nz on lane j/2's half-word (region <2;2,0>) against alternating bit
+// masks (<0;2,1>) gives the sign and nonzero predicates of all 32 channels,
+// then (Psign) sel B[c] -s2, +s2; (~Pnz) mov B[c] 0, with the scale pairs
+// hoisted per 128-group: 4 instructions per register. -DINT_DQ keeps xetla's
+// integer-op upconvert, (scale ^ sign) & magnitude. Either way the B tile
+// comes out in DT and goes straight into the DT DPAS, fp32 accumulate.
 // Requires N % 16 == 0 and K % 128 == 0.
 #pragma once
 
@@ -29,6 +35,7 @@ namespace intelex = sycl::ext::intel::experimental;
 
 constexpr int GS = 128;
 
+#ifdef INT_DQ
 // Two consecutive K codes (one nibble of the word, low bits of x) -> one VNNI
 // dword holding the two DT weights, each 0, +scale or -scale (sign = bit 15).
 inline int dq_pair(unsigned x, unsigned s2) {
@@ -38,11 +45,51 @@ inline int dq_pair(unsigned x, unsigned s2) {
     return (int)((s2 ^ sign) & mask);
 }
 
-inline int8 dq_word(unsigned w, unsigned s2) {
+inline int8 dq_word(unsigned w, unsigned s2, unsigned) {
     int8 b;
 #pragma unroll
     for (int i = 0; i < 8; ++i) b[i] = dq_pair(w >> (4 * i), s2);
     return b;
+}
+#else
+// Register c: half-word h = c / 4 of each lane's word; MK uw elements
+// mz, mz+1 / ms, ms+1 = nonzero / sign bit of rows 2c, 2c+1 in that half.
+// IGC folds each and + cmp.ne into one and.nz writing a flag.
+#define I2_ROW(c, h, mz, ms) \
+    "and (M1_NM, 32) T(0,0)<1> WH(0," #h ")<2;2,0> MK(0," #mz ")<0;2,1>\n" \
+    "cmp.ne (M1_NM, 32) PZ" #c " T(0,0)<1;1,0> 0x0:uw\n" \
+    "and (M1_NM, 32) T(0,0)<1> WH(0," #h ")<2;2,0> MK(0," #ms ")<0;2,1>\n" \
+    "cmp.ne (M1_NM, 32) PS" #c " T(0,0)<1;1,0> 0x0:uw\n" \
+    "(PS" #c ") sel (M1_NM, 32) BW(" #c ",0)<1> NW(0,0)<1;1,0> PW(0,0)<1;1,0>\n" \
+    "(PZ" #c ") sel (M1_NM, 32) BW(" #c ",0)<1> BW(" #c ",0)<1;1,0> 0x0:uw\n"
+#define I2_PDECL(c) ".decl PZ" #c " v_type=P num_elts=32\n.decl PS" #c " v_type=P num_elts=32\n"
+
+// mk = dq_mask(lane), once per kernel
+inline int8 dq_word(unsigned w, unsigned s2, unsigned mk) {
+    int8 r;
+    const unsigned n2 = s2 ^ 0x80008000u;
+    XE2_ASM("{\n"
+            ".decl WH v_type=G type=uw num_elts=32 align=GRF alias=<%1,0>\n"
+            ".decl PW v_type=G type=uw num_elts=32 align=GRF alias=<%2,0>\n"
+            ".decl NW v_type=G type=uw num_elts=32 align=GRF alias=<%3,0>\n"
+            ".decl MK v_type=G type=uw num_elts=32 align=GRF alias=<%4,0>\n"
+            ".decl BW v_type=G type=uw num_elts=256 align=GRF alias=<%0,0>\n"
+            ".decl T v_type=G type=uw num_elts=32 align=GRF\n"
+            I2_PDECL(0) I2_PDECL(1) I2_PDECL(2) I2_PDECL(3)
+            I2_PDECL(4) I2_PDECL(5) I2_PDECL(6) I2_PDECL(7)
+            I2_ROW(0, 0, 0, 8) I2_ROW(1, 0, 2, 10) I2_ROW(2, 0, 4, 12) I2_ROW(3, 0, 6, 14)
+            I2_ROW(4, 1, 0, 8) I2_ROW(5, 1, 2, 10) I2_ROW(6, 1, 4, 12) I2_ROW(7, 1, 6, 14)
+            "}\n" : "=rw"(r) : "rw"(w), "rw"(s2), "rw"(n2), "rw"(mk));
+    return r;
+}
+#undef I2_ROW
+#undef I2_PDECL
+#endif
+
+// lane k < 4: nonzero bits 4k, 4k+2 (rows 2k, 2k+1 of a half); 4 <= k < 8: sign bits
+inline unsigned dq_mask(int lane) {
+    const unsigned l = lane & 7, b = 4 * (l & 3) + (l >> 2);
+    return (1u << b) | (1u << (b + 2)) << 16;
 }
 
 template <int SGM> struct rows;
@@ -79,7 +126,7 @@ struct Gemv {
     using acc_t = typename rows<SGM>::acc_t;
     static constexpr int WG = 16 * NSG_N * LS;
 
-    static acc_t step(acc_t acc, const unsigned *w, unsigned sc, const ushort8 *ar) {
+    static acc_t step(acc_t acc, const unsigned *w, unsigned sc, const ushort8 *ar, unsigned mk) {
         const unsigned s2 = sc | (sc << 16);
 #pragma unroll
         for (int c = 0; c < 8; ++c) {
@@ -88,7 +135,7 @@ struct Gemv {
             else
 #pragma unroll
                 for (int r = 0; r < SGM; ++r) a[r] = (short)ar[r][c];
-            acc = mad_k16<BF16>(a, dq_word(w[c], s2), acc);
+            acc = mad_k16<BF16>(a, dq_word(w[c], s2, mk), acc);
         }
         return acc;
     }
@@ -119,6 +166,7 @@ struct Gemv {
         const int s_end = sycl::min(nsteps, s_begin + per);
         const surf sb(B, N * 4, K / 16, N * 4);
         unsigned pb = pl2d<b32_16x1>(sb, n0, 0);
+        const unsigned mk = dq_mask(lane);
 
         acc_t acc = 0.0f;
         if (n0 < N) {
@@ -133,7 +181,7 @@ struct Gemv {
                     load<V>(pb, m0, n0, s + V, w[V], sc[V], ar[V]);
                 });
 #pragma unroll
-                for (int u = 0; u < U; ++u) acc = step(acc, w[u], sc[u], ar[u]);
+                for (int u = 0; u < U; ++u) acc = step(acc, w[u], sc[u], ar[u], mk);
             }
             if constexpr (U > 1)
                 for (; s < s_end; ++s) {
@@ -141,7 +189,7 @@ struct Gemv {
                     ushort8 ar[SGM];
                     pl2d_y(pb, s * 8);
                     load<0>(pb, m0, n0, s, w, sc, ar);
-                    acc = step(acc, w, sc, ar);
+                    acc = step(acc, w, sc, ar, mk);
                 }
         }
 
@@ -193,12 +241,23 @@ struct GemmMT {
     int M, N, K;
 
     static constexpr int MB = MT_M / 8, NB = MT_N / 16, WG = 16 * WG_M * WG_N;
+    // A rows per 2D block read (8, 16 or 32, dividing MT_M) and K per read (32, or
+    // 16 for MT_M > 64: 32 K of A does not fit in 256 GRF next to the accumulators)
+    static constexpr int AR = MT_M % 32 == 0 ? 32 : (MT_M % 16 == 0 ? 16 : 8);
+    static constexpr int AK = MT_M <= 64 ? 32 : 16;
+    using ash = std::conditional_t<AK == 32,
+            std::conditional_t<AR == 32, b16_2x16x32, std::conditional_t<AR == 16, b16_2x16x16, b16_2x16x8>>,
+            std::conditional_t<AR == 32, b16_16x32, std::conditional_t<AR == 16, b16_16x16, b16_16x8>>>;
+    using avec = std::conditional_t<AR * AK == 1024, ushort64,
+            std::conditional_t<AR * AK == 512, ushort32, std::conditional_t<AR * AK == 256, ushort16, ushort8>>>;
 
     void operator()(sycl::nd_item<2> it) const {
-        const int sg = it.get_sub_group().get_group_linear_id();
+        const auto sgp = it.get_sub_group();
+        const int sg = sgp.get_group_linear_id();
         const int m0 = ((int)it.get_group(0) * WG_M + sg / WG_N) * MT_M;
         const int n0 = ((int)it.get_group(1) * WG_N + sg % WG_N) * MT_N;
-        const surf sa(A, K * 2, M, K * 2), sb(B, N * 4, K / 16, N * 4);
+        const surf sa(A, K * 2, M, K * 2), sb(B, N * 4, K / 16, N * 4), ss(S, N * 2, K / GS, N * 2);
+        const unsigned mk = dq_mask(sgp.get_local_linear_id());
 
         float8 acc[MB][NB];
 #pragma unroll
@@ -211,20 +270,26 @@ struct GemmMT {
 #pragma unroll
         for (int i = 0; i < MB; ++i) an[i] = __builtin_bit_cast(short8, rd_16b_8r16(sa, 0, m0 + 8 * i));
 #endif
-        // 2D payloads built once; each K step only moves y (B) or x (A)
-        unsigned pb = pl2d<b32_16x8>(sb, n0, 0);
+        // 2D payloads built once; each K step only moves y (B, S) or x (A)
+        unsigned pb = pl2d<b32_16x8>(sb, n0, 0), ps = pl2d<b16_16x1>(ss, n0, 0);
 #ifndef MT_APF
-        unsigned pa = pl2d<b16_16x8>(sa, 0, m0);
+        unsigned pa = pl2d<ash>(sa, 0, m0);
 #endif
         for (int s = 0; s < K / GS; ++s) {
             uint8 w[NB];
             unsigned s2[NB];
+#ifndef MT_APF
+            // the first A reads go out before B and the scales (as IGC orders the
+            // OpenCL kernel): the first DPAS group needs all of them
+            avec a0[MT_M / AR];
+            pl2d_x(pa, s * GS);
+            static_for<MT_M / AR>([&](auto i) { a0[i] = rd2d<ash, 0, AR * decltype(i)::value, avec>(pa); });
+#endif
             pl2d_y(pb, s * 8);
-            const unsigned short *sp = S + (size_t)s * N + n0;
+            pl2d_y(ps, s);
             static_for<NB>([&](auto j) {
                 w[j] = rd2d<b32_16x8, 16 * decltype(j)::value, 0, uint8>(pb);
-                const unsigned sc = (n0 + 16 * j < N) ? sg_rd_us(sp + 16 * j) : 0u;
-                s2[j] = sc | (sc << 16);
+                s2[j] = (unsigned)rd2d<b16_16x1, 16 * decltype(j)::value, 0, unsigned short>(ps) * 0x10001u;
             });
 #ifdef MT_APF
 #pragma unroll
@@ -235,24 +300,34 @@ struct GemmMT {
 #pragma unroll
                 for (int i = 0; i < MB; ++i)
                     an[i] = __builtin_bit_cast(short8, rd_16b_8r16(sa, s * GS + 16 * (c + 1), m0 + 8 * i));
-#else
-            pl2d_x(pa, s * GS);
-            static_for<8>([&](auto c) {
-                short8 a[MB];
-                static_for<MB>([&](auto i) {
-                    a[i] = __builtin_bit_cast(short8,
-                            rd2d<b16_16x8, 16 * decltype(c)::value, 8 * decltype(i)::value, ushort8>(pa));
-                });
-#endif
 #pragma unroll
                 for (int j = 0; j < NB; ++j) {
-                    const int8 b = dq_word(w[j][(int)c], s2[j]);
+                    const int8 b = dq_word(w[j][c], s2[j], mk);
 #pragma unroll
                     for (int i = 0; i < MB; ++i) acc[i][j] = mad_k16<BF16>(a[i], b, acc[i][j]);
                 }
-#ifdef MT_APF
             }
 #else
+            // one A read of AR rows x AK K feeds AK/16 K16 steps; the 8-row DPAS
+            // operands are GRF rows of the read, addressed in place
+            static_for<GS / AK>([&](auto c2) {
+                constexpr int C2 = decltype(c2)::value;
+                avec a[MT_M / AR];
+                static_for<MT_M / AR>([&](auto i) {
+                    if constexpr (C2 == 0) a[i] = a0[i];
+                    else a[i] = rd2d<ash, AK * C2, AR * decltype(i)::value, avec>(pa);
+                });
+                static_for<AK / 16>([&](auto h) {
+                    constexpr int H = decltype(h)::value;
+#pragma unroll
+                    for (int j = 0; j < NB; ++j) {
+                        const int8 b = dq_word(w[j][AK / 16 * C2 + H], s2[j], mk);
+                        static_for<MB>([&](auto i) {
+                            constexpr int I = decltype(i)::value;
+                            acc[I][j] = mad8_at<BF16, H * AR / 2 + 4 * (I % (AR / 8))>(a[I / (AR / 8)], b, acc[I][j]);
+                        });
+                    }
+                });
             });
 #endif
         }

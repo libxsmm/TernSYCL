@@ -8,6 +8,11 @@ AOT_DEVICES ?= bmg-g31,lnl-m
 CXXFLAGS  = -fsycl -std=c++20 -O3 -fp-model=precise -qopenmp -Wno-psabi -I../common \
             -fsycl-device-code-split=per_kernel
 LDFLAGS   = -fsycl -qopenmp
+# INT_DQ=1: xetla's integer-op int2 decode instead of the predicated selects
+ifdef INT_DQ
+CXXFLAGS += -DINT_DQ
+BUILD    ?= build_intdq
+endif
 ifndef JIT
 CXXFLAGS += -fsycl-targets=spir64_gen
 # grf_size<256> alone does not give IGC -TotalGRFNum 256 (large-M K loop then reuses A registers);
@@ -16,7 +21,7 @@ LDFLAGS  += -fsycl-targets=spir64_gen -Xs "-device $(AOT_DEVICES) -options -ze-o
             -fsycl-max-parallel-link-jobs=16
 endif
 
-BUILD  = build
+BUILD  ?= build
 TARGET = $(BUILD)/int2_fp16_upcvt_sycl
 DEPS   = int2_fp16_upcvt.hpp ../common/xe2.hpp ../common/epilogue_dev.hpp ../common/epilogue.hpp \
          ../common/dt16.hpp ../common/driver.hpp
