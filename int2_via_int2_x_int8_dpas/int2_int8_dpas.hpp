@@ -37,8 +37,8 @@ constexpr int GS = 128;
 inline int ldsa(int M) { return (M + 31) & ~31; }
 constexpr float EPS = 1.1920928955078125e-07f;  // FLT_EPSILON, xetla absmax init
 
-// two DT (low, high half of h2) -> two int8 packed in a short; clamp + RTZ
-// convert lowers to one mov.sat per element
+// two DT (low, high half of h2) -> two int8 packed in a short; clamp + round to
+// nearest even (rint + convert: rnde + mov.sat per element)
 template <bool BF16> inline short q2(unsigned h2, float sa) {
     float f0, f1;
     if constexpr (BF16) {
@@ -48,8 +48,8 @@ template <bool BF16> inline short q2(unsigned h2, float sa) {
         f0 = dt<false>::tof((unsigned short)h2);
         f1 = dt<false>::tof((unsigned short)(h2 >> 16));
     }
-    const signed char c0 = (signed char)sycl::clamp(f0 * sa, -128.0f, 127.0f);
-    const signed char c1 = (signed char)sycl::clamp(f1 * sa, -128.0f, 127.0f);
+    const signed char c0 = (signed char)sycl::rint(sycl::clamp(f0 * sa, -128.0f, 127.0f));
+    const signed char c1 = (signed char)sycl::rint(sycl::clamp(f1 * sa, -128.0f, 127.0f));
     return (short)((unsigned char)c0 | ((unsigned)(unsigned char)c1 << 8));
 }
 
@@ -59,6 +59,7 @@ template <bool BF16> inline short q2(unsigned h2, float sa) {
 // SIMD32 NoMask like xetla: call only from convergent code.
 #define TS_QROW(r, g, orow, ocol)                                               \
     "mul (M1_NM, 32) T(" #g ",0)<1> T(" #g ",0)<1;1,0> %2(0," #r ")<0;1,0>\n"  \
+    "rnde (M1_NM, 32) T(" #g ",0)<1> T(" #g ",0)<1;1,0>\n"                    \
     "mov.sat (M1_NM, 32) TB(" #g ",0)<4> T(" #g ",0)<1;1,0>\n"                 \
     "mov (M1_NM, 32) QB(" #orow "," #ocol ")<1> TB(" #g ",0)<4;1,0>\n"
 #define TS_QUANT(A2F)                                                            \
@@ -118,7 +119,7 @@ struct QuantA {
             unsigned long long q = 0;
 #pragma unroll
             for (int i = 0; i < 8; ++i)
-                q |= (unsigned long long)(unsigned char)(signed char)sycl::clamp(a[i] * s, -128.0f, 127.0f)
+                q |= (unsigned long long)(unsigned char)(signed char)sycl::rint(sycl::clamp(a[i] * s, -128.0f, 127.0f))
                         << (8 * i);
             *(unsigned long long *)(Aq + off) = q;
         }

@@ -3,7 +3,7 @@
 //   - A (--dtype fp16|bf16) in [-5, 5] fake-quantized per (row, 128-group) so
 //     that A = q / SA exactly, SA = DT(127 / absmax) recomputed from the
 //     fake-quantized A, B codes {0, 1, 3} = {0, +1, -1}, SB DT in [0.75, 15.75];
-//   - host gold: q = sat_int8(trunc(A * SA)), int32 dot per group,
+//   - host gold: q = sat_int8(rint(A * SA)), int32 dot per group,
 //     acc += float(dot) * (SB * (1 / SA)), epilogue, cast to DT;
 //   - rotating distinct weight sets (>= --weights-gib, default 2 GiB), every
 //     set warmed up, device events -- the A pre-kernel and the GEMM
@@ -149,7 +149,7 @@ static void compute_gold(const dt16 *A, const uint32_t *B, const dt16 *SA,
 #pragma omp parallel for
     for (int m = 0; m < M; ++m)
         for (int k = 0; k < K; ++k) {
-            long v = (long)(tof(A[(size_t)m * K + k]) * tof(SA[(size_t)(k / kGS) * ldsa(M) + m]));
+            long v = std::lrintf(tof(A[(size_t)m * K + k]) * tof(SA[(size_t)(k / kGS) * ldsa(M) + m]));
             q[(size_t)m * K + k] = (int8_t)std::min(127L, std::max(-128L, v));
         }
 #pragma omp parallel for collapse(2)
