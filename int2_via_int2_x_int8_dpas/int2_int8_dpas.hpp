@@ -37,8 +37,8 @@ constexpr int GS = 128;
 inline int ldsa(int M) { return (M + 31) & ~31; }
 constexpr float EPS = 1.1920928955078125e-07f;  // FLT_EPSILON, xetla absmax init
 
-// two DT (low, high half of h2) -> two int8 packed in a short; round to nearest
-// even, then clamp (rnde + mov.sat per element: IGC folds the clamp into the .sat)
+// two DT (low, high half of h2) -> two int8 packed in a short; clamp + round to
+// nearest even (rint + convert: rnde + mov.sat per element)
 template <bool BF16> inline short q2(unsigned h2, float sa) {
     float f0, f1;
     if constexpr (BF16) {
@@ -48,25 +48,21 @@ template <bool BF16> inline short q2(unsigned h2, float sa) {
         f0 = dt<false>::tof((unsigned short)h2);
         f1 = dt<false>::tof((unsigned short)(h2 >> 16));
     }
-    const signed char c0 = (signed char)sycl::clamp(sycl::rint(f0 * sa), -128.0f, 127.0f);
-    const signed char c1 = (signed char)sycl::clamp(sycl::rint(f1 * sa), -128.0f, 127.0f);
+    const signed char c0 = (signed char)sycl::rint(sycl::clamp(f0 * sa, -128.0f, 127.0f));
+    const signed char c1 = (signed char)sycl::rint(sycl::clamp(f1 * sa, -128.0f, 127.0f));
     return (short)((unsigned char)c0 | ((unsigned)(unsigned char)c1 << 8));
 }
 
 // xetla's elemwise_scale_{fp16,bf16}_to_int8 on one 8-row x 32-K block, on the
 // row-contiguous registers (SIMT code would split and re-pair every pair).
 // a: row r = a[r] (lane l holds K 2l, 2l+1); lane r of sal = scale of row r.
-// SIMD32 NoMask like xetla: call only from convergent code. RND: round to
-// nearest even (rnde) before the saturating convert, or nothing = truncate
-// toward zero as xetla.
-#define TS_RNDE(g) "rnde (M1_NM, 32) T(" #g ",0)<1> T(" #g ",0)<1;1,0>\n"
-#define TS_RTZ(g) ""
-#define TS_QROW(RND, r, g, orow, ocol)                                          \
+// SIMD32 NoMask like xetla: call only from convergent code.
+#define TS_QROW(r, g, orow, ocol)                                               \
     "mul (M1_NM, 32) T(" #g ",0)<1> T(" #g ",0)<1;1,0> %2(0," #r ")<0;1,0>\n"  \
-    RND(g)                                                                       \
+    "rnde (M1_NM, 32) T(" #g ",0)<1> T(" #g ",0)<1;1,0>\n"                    \
     "mov.sat (M1_NM, 32) TB(" #g ",0)<4> T(" #g ",0)<1;1,0>\n"                 \
     "mov (M1_NM, 32) QB(" #orow "," #ocol ")<1> TB(" #g ",0)<4;1,0>\n"
-#define TS_QUANT(A2F, RND)                                                       \
+#define TS_QUANT(A2F)                                                            \
     "{\n"                                                                        \
     ".decl AH v_type=G type=hf num_elts=256 align=GRF alias=<%1,0>\n"            \
     ".decl AW v_type=G type=uw num_elts=256 align=GRF alias=<%1,0>\n"            \
@@ -74,21 +70,19 @@ template <bool BF16> inline short q2(unsigned h2, float sa) {
     ".decl T v_type=G type=f num_elts=256 align=GRF\n"                           \
     ".decl TD v_type=G type=ud num_elts=256 align=GRF alias=<T,0>\n"             \
     ".decl TB v_type=G type=b num_elts=1024 align=GRF alias=<T,0>\n"             \
-    A2F(0, 0) TS_QROW(RND, 0, 0, 0, 0) A2F(1, 2) TS_QROW(RND, 1, 2, 0, 32)       \
-    A2F(2, 4) TS_QROW(RND, 2, 4, 1, 0) A2F(3, 6) TS_QROW(RND, 3, 6, 1, 32)       \
-    A2F(4, 8) TS_QROW(RND, 4, 8, 2, 0) A2F(5, 10) TS_QROW(RND, 5, 10, 2, 32)     \
-    A2F(6, 12) TS_QROW(RND, 6, 12, 3, 0) A2F(7, 14) TS_QROW(RND, 7, 14, 3, 32)   \
+    A2F(0, 0) TS_QROW(0, 0, 0, 0) A2F(1, 2) TS_QROW(1, 2, 0, 32)                 \
+    A2F(2, 4) TS_QROW(2, 4, 1, 0) A2F(3, 6) TS_QROW(3, 6, 1, 32)                 \
+    A2F(4, 8) TS_QROW(4, 8, 2, 0) A2F(5, 10) TS_QROW(5, 10, 2, 32)               \
+    A2F(6, 12) TS_QROW(6, 12, 3, 0) A2F(7, 14) TS_QROW(7, 14, 3, 32)             \
     "}\n"
 #define TS_A2F_BF16(r, g) "shl (M1_NM, 32) TD(" #g ",0)<1> AW(" #r ",0)<1;1,0> 0x10:uw\n"
 #define TS_A2F_FP16(r, g) "mov (M1_NM, 32) T(" #g ",0)<1> AH(" #r ",0)<1;1,0>\n"
 
-template <bool BF16, bool RTN = true> inline short8 quant8x32(uint8 a, float sal) {
+template <bool BF16> inline short8 quant8x32(uint8 a, float sal) {
     short8 q;
 #ifdef __SYCL_DEVICE_ONLY__
-    if constexpr (BF16 && RTN) __asm__ volatile(TS_QUANT(TS_A2F_BF16, TS_RNDE) : "=rw"(q) : "rw"(a), "rw"(sal));
-    else if constexpr (BF16) __asm__ volatile(TS_QUANT(TS_A2F_BF16, TS_RTZ) : "=rw"(q) : "rw"(a), "rw"(sal));
-    else if constexpr (RTN) __asm__ volatile(TS_QUANT(TS_A2F_FP16, TS_RNDE) : "=rw"(q) : "rw"(a), "rw"(sal));
-    else __asm__ volatile(TS_QUANT(TS_A2F_FP16, TS_RTZ) : "=rw"(q) : "rw"(a), "rw"(sal));
+    if constexpr (BF16) __asm__ volatile(TS_QUANT(TS_A2F_BF16) : "=rw"(q) : "rw"(a), "rw"(sal));
+    else __asm__ volatile(TS_QUANT(TS_A2F_FP16) : "=rw"(q) : "rw"(a), "rw"(sal));
 #endif
     return q;
 }
@@ -125,7 +119,7 @@ struct QuantA {
             unsigned long long q = 0;
 #pragma unroll
             for (int i = 0; i < 8; ++i)
-                q |= (unsigned long long)(unsigned char)(signed char)sycl::clamp(sycl::rint(a[i] * s), -128.0f, 127.0f)
+                q |= (unsigned long long)(unsigned char)(signed char)sycl::rint(sycl::clamp(a[i] * s, -128.0f, 127.0f))
                         << (8 * i);
             *(unsigned long long *)(Aq + off) = q;
         }
@@ -291,9 +285,7 @@ struct Gemv {
 // zero-fills out-of-range reads and clips writes, so any M works. 256 GRF.
 // The epilogue is a template parameter here (as in the OpenCL -D build): a
 // runtime-selected one costs ~3% in this kernel.
-// RTN (qmode 1 only): round A to nearest when quantizing in the GEMM (default);
-// false = truncate toward zero, bit-identical to xetla.
-template <bool BF16, int QMODE, int MT_M, int MT_N, int WG_M, int WG_N, int POSTOP, bool F32, bool RTN = true>
+template <bool BF16, int QMODE, int MT_M, int MT_N, int WG_M, int WG_N, int POSTOP, bool F32>
 struct GemmMT {
     const unsigned short *A;
     const signed char *Aq;
@@ -377,7 +369,7 @@ struct GemmMT {
                         }
                 } else {
 #pragma unroll
-                    for (int c = 0; c < 4; ++c) aq[c] = quant8x32<BF16, RTN>(ar[I][c], sal);
+                    for (int c = 0; c < 4; ++c) aq[c] = quant8x32<BF16>(ar[I][c], sal);
                 }
                 // rows >= M get inf here, but their int32 dot is 0 and the store clips them
 #pragma unroll
