@@ -258,6 +258,73 @@ Same build and methodology, `PACE=15`, both drivers pinned to E-core 4.
 
 The LNL upcvt numbers predate the select decode.
 
+## Results (Arc B580, fp16 activations)
+
+TernSYCL only (TernOCL was not built here), with the same tile lists and methodology as `bench.sh`: best tile per shape
+from the sweep, then the median of 3 re-measures; 2 GiB rotating weights, 20 iterations. AOT build for bmg-g21, oneAPI
+2025.3.3, Level Zero driver 1.17.39758, main at 42a1cec. GEMV is M = 1, GEMM is M = 1024. The int8 times include the
+activation-quantization pre-kernel. The GEMVs run at the B580's memory bandwidth (456 GB/s rated): 27B.lm_head M = 1
+streams its 338 MB of weights and scales in ~748 us (~450 GB/s).
+
+**int2_fp16_upcvt**
+
+| shape | K x N | GEMV SYCL (us) | GEMM SYCL (ms) |
+| --- | --- | ---: | ---: |
+| 8B.qkv | 4096 x 6144 | 18.1 | 0.556 |
+| 8B.o_proj | 4096 x 4096 | 12.1 | 0.380 |
+| 8B.gate_up | 4096 x 24576 | 66.4 | 2.217 |
+| 8B.down | 12288 x 4096 | 32.8 | 1.125 |
+| 8B.lm_head | 4096 x 151680 | 369.6 | 13.627 |
+| 27B.gate_up | 5120 x 34816 | 108.1 | 3.872 |
+| 27B.down | 17408 x 5120 | 56.7 | 1.845 |
+| 27B.qkvz | 5120 x 16384 | 52.5 | 1.782 |
+| 27B.out_proj | 6144 x 5120 | 21.0 | 0.669 |
+| 27B.qkv | 5120 x 14336 | 46.3 | 1.576 |
+| 27B.lm_head | 5120 x 248320 | 750.9 | 27.427 |
+
+**int2_via_int2_x_int8_dpas, qmode 0 (A quantized to int8 upfront)**
+
+| shape | K x N | GEMV SYCL (us) | GEMM SYCL (ms) |
+| --- | --- | ---: | ---: |
+| 8B.qkv | 4096 x 6144 | 17.9 | 0.349 |
+| 8B.o_proj | 4096 x 4096 | 12.7 | 0.240 |
+| 8B.gate_up | 4096 x 24576 | 64.7 | 1.395 |
+| 8B.down | 12288 x 4096 | 32.9 | 0.794 |
+| 8B.lm_head | 4096 x 151680 | 368.2 | 9.139 |
+| 27B.gate_up | 5120 x 34816 | 108.4 | 2.640 |
+| 27B.down | 17408 x 5120 | 56.0 | 1.305 |
+| 27B.qkvz | 5120 x 16384 | 52.9 | 1.177 |
+| 27B.out_proj | 6144 x 5120 | 21.5 | 0.450 |
+| 27B.qkv | 5120 x 14336 | 46.4 | 1.004 |
+| 27B.lm_head | 5120 x 248320 | 747.7 | 18.629 |
+
+**int2_via_int2_x_int8_dpas, qmode 1 (A quantized in the GEMM, as XeTLA)**
+
+| shape | K x N | GEMV SYCL (us) | GEMM SYCL (ms) |
+| --- | --- | ---: | ---: |
+| 8B.qkv | 4096 x 6144 | 17.8 | 0.408 |
+| 8B.o_proj | 4096 x 4096 | 12.7 | 0.287 |
+| 8B.gate_up | 4096 x 24576 | 64.8 | 1.580 |
+| 8B.down | 12288 x 4096 | 32.8 | 0.876 |
+| 8B.lm_head | 4096 x 151680 | 368.6 | 10.093 |
+| 27B.gate_up | 5120 x 34816 | 108.2 | 2.888 |
+| 27B.down | 17408 x 5120 | 56.1 | 1.495 |
+| 27B.qkvz | 5120 x 16384 | 52.7 | 1.327 |
+| 27B.out_proj | 6144 x 5120 | 21.5 | 0.518 |
+| 27B.qkv | 5120 x 14336 | 46.6 | 1.157 |
+| 27B.lm_head | 5120 x 248320 | 747.6 | 20.898 |
+
+**bitcos_fp16_upcvt** (Bonsai 2 27B shapes, zero density 0.40)
+
+| shape | K x N | GEMV SYCL (us) | GEMM SYCL (ms) |
+| --- | --- | ---: | ---: |
+| 27B.gate_up | 5120 x 34816 | 154.0 | 6.76 |
+| 27B.down | 17408 x 5120 | 79.1 | 3.48 |
+| 27B.qkvz | 5120 x 16384 | 77.2 | 3.21 |
+| 27B.out_proj | 6144 x 5120 | 29.8 | 1.21 |
+| 27B.qkv | 5120 x 14336 | 65.9 | 2.77 |
+| 27B.lm_head | 5120 x 248320 | 980.4 | 47.58 |
+
 ## Current vs previous main (B70, fp16)
 
 This tree (inline vISA + int2 select decode) vs main at 5e162d8 (IGC
