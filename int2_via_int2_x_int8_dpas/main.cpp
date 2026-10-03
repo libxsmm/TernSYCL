@@ -3,7 +3,9 @@
 //   - A (--dtype fp16|bf16) in [-5, 5] fake-quantized per (row, 128-group) so
 //     that A = q / SA exactly, SA = DT(127 / absmax) recomputed from the
 //     fake-quantized A, B codes {0, 1, 3} = {0, +1, -1}, SB DT in [0.75, 15.75];
-//   - host gold: q = sat_int8(trunc(A * SA)), int32 dot per group,
+//     --offgrid F moves each fake-quantized A F LSB away from zero (0 < F < 1),
+//     so the int8 rounding of A * SA is exercised (truncation vs round to nearest);
+//   - host gold: q = sat_int8(rint(A * SA)), int32 dot per group,
 //     acc += float(dot) * (SB * (1 / SA)), epilogue, cast to DT;
 //   - rotating distinct weight sets (>= --weights-gib, default 2 GiB), every
 //     set warmed up, device events -- the A pre-kernel and the GEMM
@@ -33,6 +35,8 @@
 
 static constexpr int kGS = 128;
 static int ldsa(int M) { return int8dpas::ldsa(M); }
+
+static float g_offgrid = 0.0f;  // --offgrid: A placed this many LSB off the int8 grid
 
 struct Args {
     const dt16 *A;
@@ -149,7 +153,7 @@ static void compute_gold(const dt16 *A, const uint32_t *B, const dt16 *SA,
 #pragma omp parallel for
     for (int m = 0; m < M; ++m)
         for (int k = 0; k < K; ++k) {
-            long v = (long)(tof(A[(size_t)m * K + k]) * tof(SA[(size_t)(k / kGS) * ldsa(M) + m]));
+            long v = std::lrintf(tof(A[(size_t)m * K + k]) * tof(SA[(size_t)(k / kGS) * ldsa(M) + m]));
             q[(size_t)m * K + k] = (int8_t)std::min(127L, std::max(-128L, v));
         }
 #pragma omp parallel for collapse(2)
@@ -253,7 +257,8 @@ static void run(RunConfig cfg) {
                 const float sa = tof(SA[(size_t)(k / kGS) * ldsa(M) + m]);
                 long v = std::lrintf(tof(A[(size_t)m * K + k]) * sa);
                 v = std::min(127L, std::max(-128L, v));
-                A[(size_t)m * K + k] = fromf((float)v * (1.0f / sa));
+                const float off = v >= 0 ? g_offgrid : -g_offgrid;
+                A[(size_t)m * K + k] = fromf(((float)v + off) * (1.0f / sa));
             }
         compute_scale_a(A.data(), SA.data(), M, K);
         fill_epilogue_inputs(ep, Oth, Bias, M, N, egen);
@@ -400,6 +405,7 @@ int main(int argc, char **argv) {
         else if (a == "--weights-gib" && i + 1 < argc) cfg.weights_gib = std::atof(argv[++i]);
         else if (a == "--no-validate") cfg.validate = false;
         else if (a == "--distinct-sets") cfg.distinct_sets = true;
+        else if (a == "--offgrid" && i + 1 < argc) g_offgrid = std::atof(argv[++i]);
         else if (a == "--sgm" && i + 1 < argc) cfg.sgm = ival(i);
         else if (a == "--nsg" && i + 1 < argc) cfg.nsg = ival(i);
         else if (a == "--wgn" && i + 1 < argc) cfg.nsg = ival(i) / 16;
@@ -413,7 +419,7 @@ int main(int argc, char **argv) {
         else {
             std::cout << "Usage: " << argv[0]
                       << " [--m M] [--n N] [--k K] [--dtype fp16|bf16] [--qmode 0|1] [--iters N] [--no-validate]\n"
-                         "       [--distinct-sets] [--sets N | --weights-gib G]\n"
+                         "       [--distinct-sets] [--sets N | --weights-gib G] [--offgrid F]\n"
                          "       [--sgm 1|2|4|8] [--wgn W | --nsg S] [--ls L] [--u U]\n"
                          "       [--mt-m 8k --mt-n 16k --wg-m W --wg-n W] [--list-tiles]\n"
                          "       [--postop 0|1|2|3|4] [--out-f32]   epilogue: 0 none, 1 silu(acc)*other,\n"
