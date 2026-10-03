@@ -373,8 +373,9 @@ struct GemmMT {
                     for (int c = 0; c < 4; ++c) aq[c] = quant8x32<BF16>(ar[I][c], sal);
                 }
                 // rows >= M get inf here, but their int32 dot is 0 and the store clips them
+                const float invl = sycl::native::recip(sal);
 #pragma unroll
-                for (int r = 0; r < 8; ++r) inv[r] = sycl::native::recip(sycl::group_broadcast(sgp, sal, r));
+                for (int r = 0; r < 8; ++r) inv[r] = sycl::group_broadcast(sgp, invl, r);
 #pragma unroll
                 for (int j = 0; j < NB; ++j) {
                     int8 ia = dpas_s2s8_z(aq[0], int2{(int)w[j][0], (int)w[j][1]});
